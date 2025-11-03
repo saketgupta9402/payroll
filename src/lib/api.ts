@@ -1,4 +1,27 @@
-const API_URL = "http://localhost:4000";
+const getApiBaseUrl = () => {
+  const configured = import.meta.env.VITE_API_URL?.trim();
+  if (configured) {
+    return configured.replace(/\/$/, "");
+  }
+
+  if (typeof window !== "undefined") {
+    // When running in the browser without an explicit override we rely on the Vite dev proxy
+    // (or the same-origin backend in production) by keeping the base URL relative.
+    return "";
+  }
+
+  // During SSR or node-based execution fall back to the default local API port.
+  return "http://localhost:4000";
+};
+
+const API_URL = getApiBaseUrl();
+
+const buildUrl = (endpoint: string) => {
+  if (endpoint.startsWith("http")) {
+    return endpoint;
+  }
+  return `${API_URL}${endpoint}`;
+};
 
 // --- CORE API CLIENT ---
 
@@ -9,7 +32,7 @@ const API_URL = "http://localhost:4000";
  */
 const client = {
   get: async <T>(endpoint: string): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const response = await fetch(buildUrl(endpoint), {
       method: "GET",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -25,7 +48,7 @@ const client = {
   },
 
   post: async <T>(endpoint: string, body: any): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const response = await fetch(buildUrl(endpoint), {
       method: "POST",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -94,8 +117,10 @@ export const api = {
   
   // --- Data Endpoints ---
   employees: {
-    list: (searchTerm) =>
-      client.get(`/api/employees?searchTerm=${searchTerm}`),
+    list: (searchTerm) => {
+      const query = searchTerm ? `?q=${encodeURIComponent(searchTerm)}` : "";
+      return client.get(`/api/employees${query}`);
+    },
     
     create: (data) =>
       client.post("/api/employees", data),
