@@ -29,17 +29,8 @@ export const EmployeeList = ({ searchTerm }: EmployeeListProps) => {
     // Updated query key, tenantId is not needed
     queryKey: ["employees", searchTerm],
     queryFn: async () => {
-      // Build the endpoint URL with the search term
-      const endpoint = searchTerm ? `employees?q=${encodeURIComponent(searchTerm)}` : "employees";
-      
-      // Define the expected response shape
-      type EmployeeResponse = {
-        employees: any[];
-      };
-      
-      // Call our new API endpoint
-      const data = await api.get<EmployeeResponse>(endpoint);
-      return data.employees;
+      const response = await api.employees.list(searchTerm);
+      return response.employees;
     },
   });
 

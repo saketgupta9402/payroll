@@ -1,5 +1,22 @@
 const API_URL = "http://localhost:4000";
 
+const ABSOLUTE_URL_REGEX = /^https?:\/\//i;
+const NO_PREFIX_PATHS = ["/auth", "/health"];
+
+const resolveEndpoint = (endpoint: string) => {
+  if (ABSOLUTE_URL_REGEX.test(endpoint)) {
+    return endpoint;
+  }
+
+  const withLeadingSlash = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const needsApiPrefix =
+    !withLeadingSlash.startsWith("/api") &&
+    !NO_PREFIX_PATHS.some((prefix) => withLeadingSlash.startsWith(prefix));
+
+  const finalPath = needsApiPrefix ? `/api${withLeadingSlash}` : withLeadingSlash;
+  return `${API_URL}${finalPath}`;
+};
+
 // --- CORE API CLIENT ---
 
 /**
@@ -9,7 +26,7 @@ const API_URL = "http://localhost:4000";
  */
 const client = {
   get: async <T>(endpoint: string): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const response = await fetch(resolveEndpoint(endpoint), {
       method: "GET",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -25,7 +42,7 @@ const client = {
   },
 
   post: async <T>(endpoint: string, body: any): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const response = await fetch(resolveEndpoint(endpoint), {
       method: "POST",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -94,15 +111,21 @@ export const api = {
   
   // --- Data Endpoints ---
   employees: {
-    list: (searchTerm) =>
-      client.get(`/api/employees?searchTerm=${searchTerm}`),
-    
-    create: (data) =>
-      client.post("/api/employees", data),
-    
+    list: (searchTerm?: string) => {
+      const params = new URLSearchParams();
+      if (searchTerm) {
+        params.set("q", searchTerm);
+      }
+      const queryString = params.toString();
+      const endpoint = `/api/employees${queryString ? `?${queryString}` : ""}`;
+      return client.get<{ employees: any[] }>(endpoint);
+    },
+
+    create: (data) => client.post("/api/employees", data),
+
     getCompensation: (employeeId) =>
       client.get(`/api/employees/${employeeId}/compensation`),
-    
+
     createCompensation: (employeeId, data) =>
       client.post(`/api/employees/${employeeId}/compensation`, data),
   },
