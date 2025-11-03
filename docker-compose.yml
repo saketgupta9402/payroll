@@ -1,0 +1,43 @@
+# This file is now correct.
+# The 'version' attribute is removed.
+services:
+  payroll_db:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      # --- THIS IS THE FIX ---
+      # These variables create the user, password, AND database on first run.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: payroll
+      # ---------------------
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  payroll_redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  payroll_api:
+    build:
+      context: ./server # Assumes your server's Dockerfile is in the 'server' folder
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    depends_on:
+      - payroll_db
+      - payroll_redis
+    environment:
+      # We give the API the ENCODED connection string
+      DATABASE_URL: "postgresql://postgres:mysecretpassword@payroll_db:5432/payroll"
+      REDIS_URL: "redis://payroll_redis:6379"
+      PORT: 4000
+    command: npm run dev
+
+volumes:
+  postgres_data:
+  redis_data:
