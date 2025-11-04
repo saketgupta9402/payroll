@@ -14,16 +14,9 @@ export const PayslipsTab = () => {
     // Simplified query key
     queryKey: ["my-payslips"],
     queryFn: async () => {
-      // Define the expected response shape from our new backend endpoint
-      type PayslipsResponse = {
-        payslips: any[];
-      };
-
-      // Call the new API endpoint
-      const data = await api.get<PayslipsResponse>("payslips");
-      
-      // The backend returns { payslips: [...] }, so we return data.payslips
-      return data.payslips;
+      // Use the proper API method
+      const data = await api.payslips.list();
+      return data.payslips || [];
     },
   });
 
@@ -35,8 +28,14 @@ export const PayslipsTab = () => {
     }).format(amount);
   };
 
-  const handleDownloadPayslip = (payslip: any) => {
-    toast.info("Payslip PDF generation will be implemented soon");
+  const handleDownloadPayslip = async (payslip: any) => {
+    try {
+      await api.payslips.downloadPDF(payslip.id);
+      toast.success("Payslip downloaded successfully");
+    } catch (error: any) {
+      console.error("Error downloading payslip:", error);
+      toast.error(error.message || "Failed to download payslip");
+    }
   };
 
   if (isLoading) {

@@ -55,15 +55,17 @@ const PayrollSettings = () => {
         }
 
         // Fetch existing settings
-        const { settings: fetchedSettings } = await api.get<{ settings: any }>("/payroll-settings");
+        const { settings: fetchedSettings } = await api.payrollSettings.get();
         if (fetchedSettings) {
           setSettings(formatForInput(fetchedSettings));
-        }
-      } catch (error: any) {
-        if (error.message.includes("404")) {
+        } else {
           // No settings found, use defaults
           toast.info("No existing settings found. Using defaults.");
-        } else {
+        }
+      } catch (error: any) {
+        console.error("Error fetching settings:", error);
+        // No settings found, use defaults - this is not an error
+        if (!error.message.includes("404")) {
           toast.error("Failed to load settings");
         }
       } finally {
@@ -75,6 +77,16 @@ const PayrollSettings = () => {
   }, [navigate]);
 
   const handleSave = async () => {
+    // Validate percentage sum before submitting
+    const total = (parseFloat(settings.basic_salary_percentage || '0') + 
+                   parseFloat(settings.hra_percentage || '0') + 
+                   parseFloat(settings.special_allowance_percentage || '0'));
+    
+    if (Math.abs(total - 100) > 0.01) {
+      toast.error(`Salary component percentages must sum to 100%. Current sum: ${total.toFixed(2)}%`);
+      return;
+    }
+
     setLoading(true);
     try {
       // Convert string values back to numbers for the DB
@@ -83,7 +95,7 @@ const PayrollSettings = () => {
         payload[key] = parseFloat(settings[key as keyof PayrollSettingsData]);
       }
       
-      await api.post("/payroll-settings", payload);
+      await api.payrollSettings.save(payload);
       toast.success("Payroll settings saved successfully!");
       navigate("/payroll");
     } catch (error: any) {
@@ -241,6 +253,23 @@ const PayrollSettings = () => {
                   <br />• HRA: ₹{(500000 * parseFloat(settings.hra_percentage || '0') / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
                   <br />• Special: ₹{(500000 * parseFloat(settings.special_allowance_percentage || '0') / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
                 </p>
+                {(() => {
+                  const total = (parseFloat(settings.basic_salary_percentage || '0') + 
+                                parseFloat(settings.hra_percentage || '0') + 
+                                parseFloat(settings.special_allowance_percentage || '0'));
+                  const isInvalid = Math.abs(total - 100) > 0.01;
+                  return (
+                    <div className={`mt-3 p-2 rounded text-xs ${isInvalid ? 'bg-destructive/10 text-destructive border border-destructive/20' : 'bg-green-50 dark:bg-green-950 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'}`}>
+                      <p className="font-medium">Total: {total.toFixed(2)}%</p>
+                      {isInvalid && (
+                        <p className="mt-1">⚠️ Salary components must sum to exactly 100%</p>
+                      )}
+                      {!isInvalid && (
+                        <p className="mt-1">✓ All components sum to 100%</p>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </CardContent>
           </Card>

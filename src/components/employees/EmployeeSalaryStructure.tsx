@@ -5,10 +5,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Skeleton } from "@/components/ui/skeleton";
 import { DollarSign } from "lucide-react";
 
-interface EmployeeSalaryStructureProps {
-  // employeeId and tenantId are no longer needed
-}
-
 // Define the type for a single compensation record
 type Compensation = {
   id: string;
@@ -25,18 +21,15 @@ type Compensation = {
   // ... add other fields if necessary
 };
 
-export const EmployeeSalaryStructure = ({}: EmployeeSalaryStructureProps) => {
-  const { data: compensation, isLoading } = useQuery({
-    // Updated query key, no props needed
+type CompensationResponse = {
+  compensation: Compensation | null;
+};
+
+export const EmployeeSalaryStructure = () => {
+  const { data: compensation, isLoading } = useQuery<Compensation | null>({
     queryKey: ["employee-compensation-me"],
     queryFn: async () => {
-      // Define the expected response shape
-      type CompensationResponse = {
-        compensation: Compensation | null;
-      };
-      
-      // Call our new API endpoint
-      const data = await api.get<CompensationResponse>("employees/me/compensation");
+      const data = await api.me.compensation() as CompensationResponse;
       return data.compensation;
     },
   });
@@ -83,6 +76,10 @@ export const EmployeeSalaryStructure = ({}: EmployeeSalaryStructureProps) => {
           <div className="bg-primary/10 p-4 rounded-lg">
             <p className="text-sm text-muted-foreground">Cost to Company (CTC)</p>
             <p className="text-3xl font-bold text-primary">{formatCurrency(Number(compensation.ctc))}</p>
+          </div>
+
+          <div className="mb-4">
+            <h3 className="text-lg font-semibold">Monthly Salary</h3>
           </div>
 
           <div className="grid gap-3">

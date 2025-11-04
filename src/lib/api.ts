@@ -1,5 +1,22 @@
 const API_URL = "http://localhost:4000";
 
+const ABSOLUTE_URL_REGEX = /^https?:\/\//i;
+const NO_PREFIX_PATHS = ["/auth", "/health"];
+
+const resolveEndpoint = (endpoint: string) => {
+  if (ABSOLUTE_URL_REGEX.test(endpoint)) {
+    return endpoint;
+  }
+
+  const withLeadingSlash = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const needsApiPrefix =
+    !withLeadingSlash.startsWith("/api") &&
+    !NO_PREFIX_PATHS.some((prefix) => withLeadingSlash.startsWith(prefix));
+
+  const finalPath = needsApiPrefix ? `/api${withLeadingSlash}` : withLeadingSlash;
+  return `${API_URL}${finalPath}`;
+};
+
 // --- CORE API CLIENT ---
 
 /**
@@ -9,7 +26,7 @@ const API_URL = "http://localhost:4000";
  */
 const client = {
   get: async <T>(endpoint: string): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const response = await fetch(resolveEndpoint(endpoint), {
       method: "GET",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -24,8 +41,8 @@ const client = {
     return response.json();
   },
 
-  post: async <T>(endpoint: string, body: any): Promise<T> => {
-    const response = await fetch(`${API_URL}${endpoint}`, {
+  post: async <T>(endpoint: string, body: unknown): Promise<T> => {
+    const response = await fetch(resolveEndpoint(endpoint), {
       method: "POST",
       credentials: "include", // <-- This sends the auth cookie
       headers: {
@@ -34,6 +51,20 @@ const client = {
       body: JSON.stringify(body),
     });
 
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: "API error" }));
+      throw new Error(errorData.error || `API error: ${response.statusText}`);
+    }
+    return response.json();
+  },
+
+  patch: async <T>(endpoint: string, body: unknown): Promise<T> => {
+    const response = await fetch(resolveEndpoint(endpoint), {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ error: "API error" }));
       throw new Error(errorData.error || `API error: ${response.statusText}`);
@@ -52,6 +83,7 @@ export const api = {
   // Simple .get() and .post() for general use
   get: client.get,
   post: client.post,
+  patch: client.patch,
 
   // --- Authentication ---
   auth: {
@@ -90,21 +122,33 @@ export const api = {
     
     stats: () =>
       client.get("/api/stats"),
+    
+    cycles: () =>
+      client.get("/api/payroll-cycles"),
   },
   
   // --- Data Endpoints ---
   employees: {
-    list: (searchTerm) =>
-      client.get(`/api/employees?searchTerm=${searchTerm}`),
-    
-    create: (data) =>
-      client.post("/api/employees", data),
+    list: (searchTerm?: string) => {
+      const params = new URLSearchParams();
+      if (searchTerm) {
+        params.set("q", searchTerm);
+      }
+      const queryString = params.toString();
+      const endpoint = `/api/employees${queryString ? `?${queryString}` : ""}`;
+      return client.get<{ employees: unknown[] }>(endpoint);
+    },
+
+    create: (data) => client.post("/api/employees", data),
     
     getCompensation: (employeeId) =>
       client.get(`/api/employees/${employeeId}/compensation`),
     
     createCompensation: (employeeId, data) =>
       client.post(`/api/employees/${employeeId}/compensation`, data),
+
+    updateStatus: (employeeId: string, status: string) =>
+      client.patch(`/api/employees/${employeeId}/status`, { status }),
   },
 
   payroll: {
@@ -113,11 +157,42 @@ export const api = {
     
     createCycle: (data) =>
       client.post("/api/payroll-cycles", data),
+    
+    previewCycle: (cycleId) =>
+      client.get(`/api/payroll-cycles/${cycleId}/preview`),
+    
+    processCycle: (cycleId, payrollItems?) =>
+      client.post(`/api/payroll-cycles/${cycleId}/process`, payrollItems ? { payrollItems } : {}),
+    
+    getCyclePayslips: (cycleId) =>
+      client.get(`/api/payroll-cycles/${cycleId}/payslips`),
   },
   
   payslips: {
     list: () =>
       client.get("/api/payslips"),
+    
+    downloadPDF: async (payslipId: string) => {
+      const response = await fetch(`${import.meta.env.VITE_API_URL || "http://localhost:4000"}/api/payslips/${payslipId}/pdf`, {
+        method: "GET",
+        credentials: "include", // Include cookies for authentication
+      });
+      
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: "Failed to download payslip" }));
+        throw new Error(error.error || "Failed to download payslip");
+      }
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `payslip-${payslipId}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    },
   },
 
   tax: {
@@ -129,6 +204,14 @@ export const api = {
 
     getDocuments: () =>
       client.get("/api/tax-documents"),
+  },
+
+  payrollSettings: {
+    get: () =>
+      client.get<{ settings: any }>("/api/payroll-settings"),
+    
+    save: (data) =>
+      client.post<{ settings: any }>("/api/payroll-settings", data),
   }
 };
 

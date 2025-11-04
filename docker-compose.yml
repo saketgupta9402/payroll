@@ -37,6 +37,10 @@ services:
       REDIS_URL: "redis://payroll_redis:6379"
       PORT: 4000
     command: npm run dev
+    # Mount source code for development - changes will be picked up by tsx watch
+    volumes:
+      - ./server/src:/usr/src/app/src
+      - ./server/tsconfig.json:/usr/src/app/tsconfig.json
 
 volumes:
   postgres_data:

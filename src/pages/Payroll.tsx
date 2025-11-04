@@ -73,7 +73,7 @@ const Payroll = () => {
               <p className="text-muted-foreground">Manage monthly payroll runs</p>
             </div>
             <div className="flex gap-2">
-              <Button variant="outline" onClick={() => toast.info("Payroll settings page is not yet implemented.")}>
+              <Button variant="outline" onClick={() => navigate("/payroll/settings")}>
                 <Settings className="mr-2 h-4 w-4" />
                 Configure Payroll
               </Button>
@@ -104,7 +104,7 @@ const Payroll = () => {
                 <p className="text-muted-foreground mt-4">Loading payroll cycles...</p>
               </div>
             ) : (
-              <PayrollCycleList cycles={cycles} />
+              <PayrollCycleList cycles={cycles} onRefresh={fetchCycles} />
             )}
           </CardContent>
         </Card>

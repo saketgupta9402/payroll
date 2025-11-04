@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Building2, Users, IndianRupee, FileText, LogOut, PlusCircle } from "lucide-react";
+import { Building2, Users, IndianRupee, FileText, LogOut, PlusCircle, Calendar, CheckCircle2, Clock } from "lucide-react";
 import { toast } from "sonner";
 
 // Define a type for the profile state
@@ -25,8 +25,12 @@ const Dashboard = () => {
     totalEmployees: 0,
     monthlyPayroll: 0,
     pendingApprovals: 0,
-    activeCycles: 0
+    activeCycles: 0,
+    totalNetPayable: 0,
+    completedCycles: 0,
+    totalAnnualPayroll: 0
   });
+  const [recentCycles, setRecentCycles] = useState<any[]>([]);
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -50,16 +54,21 @@ const Dashboard = () => {
       if (!user) return;
       
       try {
-        // Fetch profile, tenant, and stats
-        const [profileRes, tenantRes, statsRes] = await Promise.all([
+        // Fetch profile, tenant, stats, and recent cycles
+        const [profileRes, tenantRes, statsRes, cyclesRes] = await Promise.all([
           api.me.profile(),
           api.dashboard.tenant(),
           api.dashboard.stats(),
+          api.dashboard.cycles(),
         ]);
 
         if (profileRes?.profile) setProfile(profileRes.profile);
         if (tenantRes?.tenant?.company_name) setCompanyName(tenantRes.tenant.company_name);
         if (statsRes?.stats) setStats(statsRes.stats);
+        if (cyclesRes?.cycles) {
+          // Get recent 5 cycles
+          setRecentCycles(cyclesRes.cycles.slice(0, 5));
+        }
 
       } catch (error: any) {
         toast.error(`Failed to load dashboard: ${error.message}`);
@@ -153,8 +162,44 @@ const Dashboard = () => {
 
           <Card className="shadow-md hover:shadow-lg transition-shadow">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle className="text-sm font-medium">Completed Cycles</CardTitle>
+              <CheckCircle2 className="h-4 w-4 text-muted-foreground" />
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{stats.completedCycles}</div>
+              <p className="text-xs text-muted-foreground">Processed this year</p>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Additional Stats Row */}
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 mb-8">
+          <Card className="shadow-md hover:shadow-lg transition-shadow">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle className="text-sm font-medium">Net Payable</CardTitle>
+              <IndianRupee className="h-4 w-4 text-green-500" />
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">₹{stats.totalNetPayable.toLocaleString('en-IN')}</div>
+              <p className="text-xs text-muted-foreground">Last processed cycle</p>
+            </CardContent>
+          </Card>
+
+          <Card className="shadow-md hover:shadow-lg transition-shadow">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+              <CardTitle className="text-sm font-medium">Annual Payroll</CardTitle>
+              <FileText className="h-4 w-4 text-blue-500" />
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">₹{stats.totalAnnualPayroll.toLocaleString('en-IN')}</div>
+              <p className="text-xs text-muted-foreground">Total this year</p>
+            </CardContent>
+          </Card>
+
+          <Card className="shadow-md hover:shadow-lg transition-shadow">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
               <CardTitle className="text-sm font-medium">Active Cycles</CardTitle>
-              <Building2 className="h-4 w-4 text-muted-foreground" />
+              <Clock className="h-4 w-4 text-orange-500" />
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{stats.activeCycles}</div>
@@ -162,6 +207,65 @@ const Dashboard = () => {
             </CardContent>
           </Card>
         </div>
+
+        {/* Recent Payroll Cycles */}
+        {recentCycles.length > 0 && (
+          <Card className="mb-8 shadow-md">
+            <CardHeader>
+              <CardTitle className="flex items-center">
+                <Calendar className="mr-2 h-5 w-5 text-primary" />
+                Recent Payroll Cycles
+              </CardTitle>
+              <CardDescription>Latest payroll processing activity</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-3">
+                {recentCycles.map((cycle: any) => {
+                  const monthName = new Date(2000, cycle.month - 1).toLocaleString('en-IN', { month: 'long' });
+                  const statusColor = 
+                    cycle.status === 'completed' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300' :
+                    cycle.status === 'processing' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300' :
+                    cycle.status === 'draft' ? 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300' :
+                    'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300';
+                  
+                  return (
+                    <div 
+                      key={cycle.id} 
+                      className="flex items-center justify-between p-3 border rounded-lg hover:bg-muted/50 cursor-pointer transition-colors"
+                      onClick={() => navigate("/payroll")}
+                    >
+                      <div className="flex items-center space-x-4">
+                        <div className="w-12 h-12 rounded-lg bg-primary/10 flex items-center justify-center">
+                          <Calendar className="h-6 w-6 text-primary" />
+                        </div>
+                        <div>
+                          <p className="font-semibold">{monthName} {cycle.year}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {cycle.total_employees || 0} employees • 
+                            ₹{(cycle.total_amount || 0).toLocaleString('en-IN')}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-3">
+                        <span className={`px-2 py-1 rounded text-xs font-medium ${statusColor}`}>
+                          {cycle.status.replace('_', ' ').toUpperCase()}
+                        </span>
+                        <FileText className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <Button 
+                variant="outline" 
+                className="w-full mt-4" 
+                onClick={() => navigate("/payroll")}
+              >
+                View All Payroll Cycles
+              </Button>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Quick Actions */}
         <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">

@@ -45,10 +45,16 @@ export const CreatePayrollDialog = ({ onSuccess }: CreatePayrollDialogProps) => 
   }, [month, year]);
 
   useEffect(() => {
-    // Fetch employee data when the dialog opens
+    // Fetch employee data when month/year changes or dialog opens
     const fetchEmployeeData = async () => {
+      if (!month || !year) return;
+      
       try {
-        const data = await api.get<{ employeeCount: number, totalCompensation: number }>("payroll/new-cycle-data");
+        const params = new URLSearchParams({
+          month: month,
+          year: year,
+        });
+        const data = await api.get<{ employeeCount: number, totalCompensation: number }>(`payroll/new-cycle-data?${params.toString()}`);
         setEmployeeCount(data.employeeCount || 0);
         setTotalCompensation(data.totalCompensation || 0);
       } catch (error: any) {
@@ -56,10 +62,10 @@ export const CreatePayrollDialog = ({ onSuccess }: CreatePayrollDialogProps) => 
       }
     };
 
-    if (open) {
+    if (open && month && year) {
       fetchEmployeeData();
     }
-  }, [open]);
+  }, [open, month, year]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

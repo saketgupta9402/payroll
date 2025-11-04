@@ -13,7 +13,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
-import { DollarSign } from "lucide-react";
+import { Edit2, UserX } from "lucide-react";
 // Use aliased path for dialog component
 import { ManageCompensationDialog } from "@/components/employees/ManageCompensationDialog";
 
@@ -22,24 +22,27 @@ interface EmployeeListProps {
   // tenantId is no longer needed
 }
 
+interface Employee {
+  id: string;
+  employee_code: string;
+  full_name: string;
+  email: string;
+  department?: string;
+  designation?: string;
+  status: string;
+  date_of_joining: string;
+  monthly_gross_salary?: number;
+}
+
 export const EmployeeList = ({ searchTerm }: EmployeeListProps) => {
-  const [selectedEmployee, setSelectedEmployee] = useState<{ id: string; name: string } | null>(null);
+  const [selectedEmployee, setSelectedEmployee] = useState<{ id: string; name: string; joiningDate?: string } | null>(null);
   
   const { data: employees, isLoading } = useQuery({
     // Updated query key, tenantId is not needed
     queryKey: ["employees", searchTerm],
     queryFn: async () => {
-      // Build the endpoint URL with the search term
-      const endpoint = searchTerm ? `employees?q=${encodeURIComponent(searchTerm)}` : "employees";
-      
-      // Define the expected response shape
-      type EmployeeResponse = {
-        employees: any[];
-      };
-      
-      // Call our new API endpoint
-      const data = await api.get<EmployeeResponse>(endpoint);
-      return data.employees;
+      const response = await api.employees.list(searchTerm);
+      return response.employees;
     },
   });
 
@@ -95,7 +98,7 @@ export const EmployeeList = ({ searchTerm }: EmployeeListProps) => {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {employees.map((employee) => (
+            {employees.map((employee: Employee) => (
               <TableRow key={employee.id}>
                 <TableCell className="font-medium">{employee.employee_code}</TableCell>
                 <TableCell>{employee.full_name}</TableCell>
@@ -107,16 +110,49 @@ export const EmployeeList = ({ searchTerm }: EmployeeListProps) => {
                   {new Date(employee.date_of_joining).toLocaleDateString("en-IN")}
                 </TableCell>
                 <TableCell>
-                  <Button
-                    size="sm"
-                    variant="outline"
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">
+                      {employee.monthly_gross_salary !== undefined && employee.monthly_gross_salary !== null
+                        ? new Intl.NumberFormat("en-IN", {
+                            style: "currency",
+                            currency: "INR",
+                            maximumFractionDigits: 0,
+                          }).format(Number(employee.monthly_gross_salary))
+                        : "-"}
+                    </span>
+                    {employee.status === 'active' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={async () => {
+                          if (confirm(`Mark ${employee.full_name} as left?`)) {
+                            try {
+                              await api.employees.updateStatus(employee.id, 'terminated');
+                              // refresh list
+                              // We rely on query invalidation elsewhere, but just force a refetch via window event
+                              // Better: use queryClient, but not imported here, so trigger reload
+                              location.reload();
+                            } catch (e) {
+                              // no-op
+                            }
+                          }
+                        }}
+                        title="Mark as Left"
+                      >
+                        <UserX className="h-4 w-4" />
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
                     onClick={() =>
-                      setSelectedEmployee({ id: employee.id, name: employee.full_name })
+                      setSelectedEmployee({ id: employee.id, name: employee.full_name, joiningDate: employee.date_of_joining })
                     }
-                  >
-                    <DollarSign className="h-4 w-4 mr-1" />
-                    Salary
-                  </Button>
+                      title="Edit Salary"
+                    >
+                      <Edit2 className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -130,6 +166,7 @@ export const EmployeeList = ({ searchTerm }: EmployeeListProps) => {
           onOpenChange={(open) => !open && setSelectedEmployee(null)}
           employeeId={selectedEmployee.id}
           employeeName={selectedEmployee.name}
+          joiningDate={selectedEmployee.joiningDate}
           // tenantId is no longer passed
         />
       )}
