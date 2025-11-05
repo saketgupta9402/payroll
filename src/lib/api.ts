@@ -212,6 +212,54 @@ export const api = {
     
     save: (data) =>
       client.post<{ settings: any }>("/api/payroll-settings", data),
-  }
+  },
+
+  // --- Leave Management ---
+  leaves: {
+    // Employee self-service
+    getMyLeaves: (params?: { status?: string; month?: number; year?: number }) => {
+      const queryParams = new URLSearchParams();
+      if (params?.status) queryParams.set("status", params.status);
+      if (params?.month) queryParams.set("month", params.month.toString());
+      if (params?.year) queryParams.set("year", params.year.toString());
+      const queryString = queryParams.toString();
+      return client.get<{ leaveRequests: any[] }>(`/api/leave-requests/me${queryString ? `?${queryString}` : ""}`);
+    },
+
+    createMyLeave: (data: { leaveType: string; startDate: string; endDate: string; reason?: string }) =>
+      client.post<{ leaveRequest: any }>("/api/leave-requests/me", data),
+
+    getMyLeaveSummary: (month?: number, year?: number) => {
+      const queryParams = new URLSearchParams();
+      if (month) queryParams.set("month", month.toString());
+      if (year) queryParams.set("year", year.toString());
+      const queryString = queryParams.toString();
+      return client.get<{
+        month: number;
+        year: number;
+        totalWorkingDays: number;
+        lopDays: number;
+        paidDays: number;
+        sickLeaveDays: number;
+        casualLeaveDays: number;
+        paidLeaveDays: number;
+        totalLeaveDays: number;
+      }>(`/api/leave-summary/me${queryString ? `?${queryString}` : ""}`);
+    },
+  },
+
+  // --- Attendance Management ---
+  attendance: {
+    // Employee self-service
+    getMyAttendance: (params?: { month?: number; year?: number; startDate?: string; endDate?: string }) => {
+      const queryParams = new URLSearchParams();
+      if (params?.month) queryParams.set("month", params.month.toString());
+      if (params?.year) queryParams.set("year", params.year.toString());
+      if (params?.startDate) queryParams.set("startDate", params.startDate);
+      if (params?.endDate) queryParams.set("endDate", params.endDate);
+      const queryString = queryParams.toString();
+      return client.get<{ attendanceRecords: any[] }>(`/api/attendance/me${queryString ? `?${queryString}` : ""}`);
+    },
+  },
 };
 

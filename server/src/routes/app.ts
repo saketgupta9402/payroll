@@ -33,6 +33,62 @@ async function getUserTenant(userId: string) {
   return profile.rows[0];
 }
 
+// Helper function to calculate LOP days and paid days for an employee in a payroll month
+async function calculateLopAndPaidDays(
+  tenantId: string,
+  employeeId: string,
+  month: number,
+  year: number
+): Promise<{ lopDays: number; paidDays: number; totalWorkingDays: number }> {
+  // Calculate total working days in the month
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const totalWorkingDays = daysInMonth;
+
+  // Get approved LOP leave requests for the month
+  const leaveResult = await query<{ lop_days: string }>(
+    `SELECT 
+      COALESCE(SUM(CASE WHEN leave_type = 'loss_of_pay' THEN days ELSE 0 END), 0)::text as lop_days
+    FROM leave_requests
+    WHERE tenant_id = $1 
+      AND employee_id = $2
+      AND status = 'approved'
+      AND (
+        (EXTRACT(YEAR FROM start_date) = $3 AND EXTRACT(MONTH FROM start_date) = $4) OR
+        (EXTRACT(YEAR FROM end_date) = $3 AND EXTRACT(MONTH FROM end_date) = $4) OR
+        (start_date <= DATE '${year}-${month}-01' AND end_date >= DATE '${year}-${month}-01')
+      )`,
+    [tenantId, employeeId, year, month]
+  );
+
+  // Get LOP days from attendance records
+  const attendanceResult = await query<{ lop_days_from_attendance: string }>(
+    `SELECT 
+      COUNT(*)::text as lop_days_from_attendance
+    FROM attendance_records
+    WHERE tenant_id = $1 
+      AND employee_id = $2
+      AND is_lop = true
+      AND EXTRACT(YEAR FROM attendance_date) = $3
+      AND EXTRACT(MONTH FROM attendance_date) = $4`,
+    [tenantId, employeeId, year, month]
+  );
+
+  const leaveLopDays = Number(leaveResult.rows[0]?.lop_days || 0);
+  const attendanceLopDays = Number(attendanceResult.rows[0]?.lop_days_from_attendance || 0);
+  
+  // Total LOP days (from leave requests + attendance records)
+  const lopDays = leaveLopDays + attendanceLopDays;
+  
+  // Calculate paid days (working days - LOP days)
+  const paidDays = Math.max(0, totalWorkingDays - lopDays);
+
+  return {
+    lopDays,
+    paidDays,
+    totalWorkingDays
+  };
+}
+
 // --- UPDATED MIDDLEWARE ---
 // This middleware is now async. It verifies the user AND gets their tenant info.
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -147,7 +203,7 @@ appRouter.get("/stats", requireAuth, async (req, res) => {
 
   const cycles = cyclesQ.rows;
   const activeCycles = cycles.filter(c => c.status === "draft").length;
-  const pendingApprovals = cycles.filter(c => c.status === "processing").length;
+  const pendingApprovals = cycles.filter(c => c.status === "pending_approval").length;
   const completedCycles = cycles.filter(c => c.status === "completed").length;
   
   // Get last approved/completed cycle for monthly payroll
@@ -440,27 +496,61 @@ appRouter.get("/payslips", requireAuth, async (req, res) => {
 
             if (gross === 0) continue; // Skip if no salary
 
-            const pf = (basic * Number(settings.pf_rate)) / 100;
-            const esi = gross <= 21000 ? (gross * 0.75) / 100 : 0;
+            // Calculate LOP days and paid days for this month
+            const { lopDays, paidDays, totalWorkingDays } = await calculateLopAndPaidDays(
+              tenantId,
+              emp.id,
+              m,
+              y
+            );
+
+            // Adjust gross salary based on paid days (proportional deduction for LOP)
+            const dailyRate = gross / totalWorkingDays;
+            const adjustedGross = dailyRate * paidDays;
+
+            // Recalculate components proportionally
+            const adjustmentRatio = paidDays / totalWorkingDays;
+            const adjustedBasic = basic * adjustmentRatio;
+            const adjustedHra = hra * adjustmentRatio;
+            const adjustedSa = sa * adjustmentRatio;
+
+            // Calculate deductions based on adjusted gross
+            const pf = (adjustedBasic * Number(settings.pf_rate)) / 100;
+            const esi = adjustedGross <= 21000 ? (adjustedGross * 0.75) / 100 : 0;
             const pt = Number(settings.pt_rate) || 200;
-            const annual = gross * 12;
+            const annual = adjustedGross * 12;
             const tds = annual > Number(settings.tds_threshold) ? ((annual - Number(settings.tds_threshold)) * 5) / 100 / 12 : 0;
             const deductions = pf + esi + pt + tds;
-            const net = gross - deductions;
+            const net = adjustedGross - deductions;
 
             await query(
               `INSERT INTO payroll_items (
                 tenant_id, payroll_cycle_id, employee_id,
                 gross_salary, deductions, net_salary,
                 basic_salary, hra, special_allowance,
-                pf_deduction, esi_deduction, tds_deduction, pt_deduction
-              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-              ON CONFLICT (payroll_cycle_id, employee_id) DO NOTHING`,
-              [tenantId, cycleId, emp.id, gross, deductions, net, basic, hra, sa, pf, esi, tds, pt]
+                pf_deduction, esi_deduction, tds_deduction, pt_deduction,
+                lop_days, paid_days, total_working_days
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+              ON CONFLICT (payroll_cycle_id, employee_id) DO UPDATE SET
+                gross_salary = EXCLUDED.gross_salary,
+                deductions = EXCLUDED.deductions,
+                net_salary = EXCLUDED.net_salary,
+                basic_salary = EXCLUDED.basic_salary,
+                hra = EXCLUDED.hra,
+                special_allowance = EXCLUDED.special_allowance,
+                pf_deduction = EXCLUDED.pf_deduction,
+                esi_deduction = EXCLUDED.esi_deduction,
+                tds_deduction = EXCLUDED.tds_deduction,
+                pt_deduction = EXCLUDED.pt_deduction,
+                lop_days = EXCLUDED.lop_days,
+                paid_days = EXCLUDED.paid_days,
+                total_working_days = EXCLUDED.total_working_days,
+                updated_at = NOW()`,
+              [tenantId, cycleId, emp.id, adjustedGross, deductions, net, adjustedBasic, adjustedHra, adjustedSa, pf, esi, tds, pt, lopDays, paidDays, totalWorkingDays]
             );
 
             processedCount++;
-            totalGross += gross;
+            totalGross += adjustedGross;
           }
 
           // Update cycle totals with correct counts
@@ -591,10 +681,10 @@ appRouter.get("/payslips/:payslipId/pdf", requireAuth, async (req, res) => {
     const payslip = payslipResult.rows[0];
     const monthName = new Date(2000, payslip.month - 1).toLocaleString('en-IN', { month: 'long' });
     
-    // Calculate working days (assuming month has standard days, can be enhanced)
-    const daysInMonth = new Date(payslip.year, payslip.month, 0).getDate();
-    const totalWorkingDays = daysInMonth;
-    const totalPaidDays = totalWorkingDays; // Can be calculated based on leave, etc.
+    // Get LOP days and paid days from payroll_items (if available, otherwise calculate)
+    const totalWorkingDays = Number(payslip.total_working_days) || new Date(payslip.year, payslip.month, 0).getDate();
+    const lopDays = Number(payslip.lop_days) || 0;
+    const totalPaidDays = Number(payslip.paid_days) || totalWorkingDays;
 
     // Create PDF
     const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -1415,21 +1505,41 @@ appRouter.post("/payroll-cycles", requireAuth, async (req, res) => {
           gross = basic + hra + sa; // DA/LTA/Bonus remain 0 in fallback
         }
 
-        const pf = (basic * Number(settings.pf_rate)) / 100;
-        const esi = gross <= 21000 ? (gross * 0.75) / 100 : 0;
+        // Calculate LOP days and paid days for this month
+        const { lopDays, paidDays, totalWorkingDays } = await calculateLopAndPaidDays(
+          tenantId,
+          emp.id,
+          cycle.month,
+          cycle.year
+        );
+
+        // Adjust gross salary based on paid days (proportional deduction for LOP)
+        const dailyRate = gross / totalWorkingDays;
+        const adjustedGross = dailyRate * paidDays;
+
+        // Recalculate components proportionally
+        const adjustmentRatio = paidDays / totalWorkingDays;
+        const adjustedBasic = basic * adjustmentRatio;
+        const adjustedHra = hra * adjustmentRatio;
+        const adjustedSa = sa * adjustmentRatio;
+
+        // Calculate deductions based on adjusted gross
+        const pf = (adjustedBasic * Number(settings.pf_rate)) / 100;
+        const esi = adjustedGross <= 21000 ? (adjustedGross * 0.75) / 100 : 0;
         const pt = Number(settings.pt_rate) || 200;
-        const annual = gross * 12;
+        const annual = adjustedGross * 12;
         const tds = annual > Number(settings.tds_threshold) ? ((annual - Number(settings.tds_threshold)) * 5) / 100 / 12 : 0;
         const deductions = pf + esi + pt + tds;
-        const net = gross - deductions;
+        const net = adjustedGross - deductions;
 
         await query(
           `INSERT INTO payroll_items (
             tenant_id, payroll_cycle_id, employee_id,
             gross_salary, deductions, net_salary,
             basic_salary, hra, special_allowance,
-            pf_deduction, esi_deduction, tds_deduction, pt_deduction
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            pf_deduction, esi_deduction, tds_deduction, pt_deduction,
+            lop_days, paid_days, total_working_days
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
           ON CONFLICT (payroll_cycle_id, employee_id) DO UPDATE SET
             gross_salary = EXCLUDED.gross_salary,
             deductions = EXCLUDED.deductions,
@@ -1441,26 +1551,32 @@ appRouter.post("/payroll-cycles", requireAuth, async (req, res) => {
             esi_deduction = EXCLUDED.esi_deduction,
             tds_deduction = EXCLUDED.tds_deduction,
             pt_deduction = EXCLUDED.pt_deduction,
+            lop_days = EXCLUDED.lop_days,
+            paid_days = EXCLUDED.paid_days,
+            total_working_days = EXCLUDED.total_working_days,
             updated_at = NOW()`,
           [
             tenantId,
             cycle.id,
             emp.id,
-            gross,
+            adjustedGross,
             deductions,
             net,
-            basic,
-            hra,
-            sa,
+            adjustedBasic,
+            adjustedHra,
+            adjustedSa,
             pf,
             esi,
             tds,
             pt,
+            lopDays,
+            paidDays,
+            totalWorkingDays,
           ]
         );
 
         processedCount += 1;
-        totalGrossSalary += gross;
+        totalGrossSalary += adjustedGross;
         totalDeductions += deductions;
       }
 
@@ -1565,6 +1681,14 @@ appRouter.get("/payroll-cycles/:cycleId/preview", requireAuth, async (req, res) 
     }
 
     const cycle = cycleResult.rows[0];
+
+    // Allow preview for draft, pending_approval, approved, processing, and completed cycles
+    if (!['draft', 'pending_approval', 'approved', 'processing', 'completed'].includes(cycle.status)) {
+      return res.status(400).json({ 
+        error: `Cannot preview payroll. Current status is '${cycle.status}'.` 
+      });
+    }
+
     const payrollMonth = cycle.month;
     const payrollYear = cycle.year;
     const payrollMonthEnd = new Date(payrollYear, payrollMonth, 0);
@@ -1626,12 +1750,33 @@ appRouter.get("/payroll-cycles/:cycleId/preview", requireAuth, async (req, res) 
       // Gross salary = sum of all monthly earnings
       const grossSalary = monthlyBasic + monthlyHRA + monthlySpecialAllowance + monthlyDA + monthlyLTA + monthlyBonus;
 
-      // Calculate deductions
-      const pfDeduction = (monthlyBasic * Number(settings.pf_rate)) / 100;
-      const esiDeduction = grossSalary <= 21000 ? (grossSalary * 0.75) / 100 : 0;
+      // Calculate LOP days and paid days for this month
+      const { lopDays, paidDays, totalWorkingDays } = await calculateLopAndPaidDays(
+        tenantId,
+        employee.id,
+        payrollMonth,
+        payrollYear
+      );
+
+      // Adjust gross salary based on paid days (proportional deduction for LOP)
+      const dailyRate = grossSalary / totalWorkingDays;
+      const adjustedGrossSalary = dailyRate * paidDays;
+
+      // Recalculate components proportionally
+      const adjustmentRatio = paidDays / totalWorkingDays;
+      const adjustedBasic = monthlyBasic * adjustmentRatio;
+      const adjustedHRA = monthlyHRA * adjustmentRatio;
+      const adjustedSpecialAllowance = monthlySpecialAllowance * adjustmentRatio;
+      const adjustedDA = monthlyDA * adjustmentRatio;
+      const adjustedLTA = monthlyLTA * adjustmentRatio;
+      const adjustedBonus = monthlyBonus * adjustmentRatio;
+
+      // Calculate deductions based on adjusted gross
+      const pfDeduction = (adjustedBasic * Number(settings.pf_rate)) / 100;
+      const esiDeduction = adjustedGrossSalary <= 21000 ? (adjustedGrossSalary * 0.75) / 100 : 0;
       const ptDeduction = Number(settings.pt_rate) || 200;
       
-      const annualIncome = grossSalary * 12;
+      const annualIncome = adjustedGrossSalary * 12;
       let tdsDeduction = 0;
       if (annualIncome > Number(settings.tds_threshold)) {
         const excessAmount = annualIncome - Number(settings.tds_threshold);
@@ -1639,26 +1784,29 @@ appRouter.get("/payroll-cycles/:cycleId/preview", requireAuth, async (req, res) 
       }
 
       const totalDeductions = pfDeduction + esiDeduction + ptDeduction + tdsDeduction;
-      const netSalary = grossSalary - totalDeductions;
+      const netSalary = adjustedGrossSalary - totalDeductions;
 
       payrollItems.push({
         employee_id: employee.id,
         employee_code: employee.employee_code,
         employee_name: employee.full_name,
         employee_email: employee.email,
-        basic_salary: monthlyBasic,
-        hra: monthlyHRA,
-        special_allowance: monthlySpecialAllowance,
-        da: monthlyDA,
-        lta: monthlyLTA,
-        bonus: monthlyBonus,
-        gross_salary: grossSalary,
+        basic_salary: adjustedBasic,
+        hra: adjustedHRA,
+        special_allowance: adjustedSpecialAllowance,
+        da: adjustedDA,
+        lta: adjustedLTA,
+        bonus: adjustedBonus,
+        gross_salary: adjustedGrossSalary,
         pf_deduction: pfDeduction,
         esi_deduction: esiDeduction,
         pt_deduction: ptDeduction,
         tds_deduction: tdsDeduction,
         deductions: totalDeductions,
         net_salary: netSalary,
+        lop_days: lopDays,
+        paid_days: paidDays,
+        total_working_days: totalWorkingDays,
       });
     }
 
@@ -1670,7 +1818,179 @@ appRouter.get("/payroll-cycles/:cycleId/preview", requireAuth, async (req, res) 
   }
 });
 
+// Submit payroll for approval (draft -> pending_approval)
+appRouter.post("/payroll-cycles/:cycleId/submit", requireAuth, async (req, res) => {
+  const userId = (req as any).userId as string;
+  const tenantId = (req as any).tenantId as string;
+  const { cycleId } = req.params;
+
+  if (!tenantId) {
+    return res.status(403).json({ error: "User tenant not found" });
+  }
+
+  try {
+    // Get payroll cycle
+    const cycleResult = await query(
+      "SELECT * FROM payroll_cycles WHERE id = $1 AND tenant_id = $2",
+      [cycleId, tenantId]
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: "Payroll cycle not found" });
+    }
+
+    const cycle = cycleResult.rows[0];
+
+    // Only allow submission from draft status
+    if (cycle.status !== 'draft') {
+      return res.status(400).json({ 
+        error: `Cannot submit payroll. Current status is '${cycle.status}'. Only 'draft' payroll can be submitted for approval.` 
+      });
+    }
+
+    // Check if payroll items exist
+    const itemsResult = await query(
+      "SELECT COUNT(*)::text as count FROM payroll_items WHERE payroll_cycle_id = $1 AND tenant_id = $2",
+      [cycleId, tenantId]
+    );
+
+    const itemsCount = parseInt(itemsResult.rows[0]?.count || '0', 10);
+    if (itemsCount === 0) {
+      return res.status(400).json({ 
+        error: "Cannot submit payroll. No payroll items found. Please process the payroll first." 
+      });
+    }
+
+    // Update cycle status to pending_approval
+    const updateResult = await query(
+      `UPDATE payroll_cycles
+       SET status = 'pending_approval',
+           submitted_by = $1,
+           submitted_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $2 AND tenant_id = $3
+       RETURNING *`,
+      [userId, cycleId, tenantId]
+    );
+
+    return res.status(200).json({ 
+      message: "Payroll submitted for approval successfully",
+      payrollCycle: updateResult.rows[0]
+    });
+  } catch (e: any) {
+    console.error("Error submitting payroll for approval:", e);
+    return res.status(500).json({ error: e.message || "Failed to submit payroll for approval" });
+  }
+});
+
+// Approve payroll (pending_approval -> approved)
+appRouter.post("/payroll-cycles/:cycleId/approve", requireAuth, async (req, res) => {
+  const userId = (req as any).userId as string;
+  const tenantId = (req as any).tenantId as string;
+  const { cycleId } = req.params;
+
+  if (!tenantId) {
+    return res.status(403).json({ error: "User tenant not found" });
+  }
+
+  try {
+    // Get payroll cycle
+    const cycleResult = await query(
+      "SELECT * FROM payroll_cycles WHERE id = $1 AND tenant_id = $2",
+      [cycleId, tenantId]
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: "Payroll cycle not found" });
+    }
+
+    const cycle = cycleResult.rows[0];
+
+    // Only allow approval from pending_approval status
+    if (cycle.status !== 'pending_approval') {
+      return res.status(400).json({ 
+        error: `Cannot approve payroll. Current status is '${cycle.status}'. Only 'pending_approval' payroll can be approved.` 
+      });
+    }
+
+    // Update cycle status to approved
+    const updateResult = await query(
+      `UPDATE payroll_cycles
+       SET status = 'approved',
+           approved_by = $1,
+           approved_at = NOW(),
+           updated_at = NOW()
+       WHERE id = $2 AND tenant_id = $3
+       RETURNING *`,
+      [userId, cycleId, tenantId]
+    );
+
+    return res.status(200).json({ 
+      message: "Payroll approved successfully",
+      payrollCycle: updateResult.rows[0]
+    });
+  } catch (e: any) {
+    console.error("Error approving payroll:", e);
+    return res.status(500).json({ error: e.message || "Failed to approve payroll" });
+  }
+});
+
+// Reject/Return payroll (pending_approval -> draft)
+appRouter.post("/payroll-cycles/:cycleId/reject", requireAuth, async (req, res) => {
+  const userId = (req as any).userId as string;
+  const tenantId = (req as any).tenantId as string;
+  const { cycleId } = req.params;
+  const { rejectionReason } = req.body;
+
+  if (!tenantId) {
+    return res.status(403).json({ error: "User tenant not found" });
+  }
+
+  try {
+    // Get payroll cycle
+    const cycleResult = await query(
+      "SELECT * FROM payroll_cycles WHERE id = $1 AND tenant_id = $2",
+      [cycleId, tenantId]
+    );
+
+    if (cycleResult.rows.length === 0) {
+      return res.status(404).json({ error: "Payroll cycle not found" });
+    }
+
+    const cycle = cycleResult.rows[0];
+
+    // Only allow rejection from pending_approval status
+    if (cycle.status !== 'pending_approval') {
+      return res.status(400).json({ 
+        error: `Cannot reject payroll. Current status is '${cycle.status}'. Only 'pending_approval' payroll can be rejected.` 
+      });
+    }
+
+    // Update cycle status back to draft
+    const updateResult = await query(
+      `UPDATE payroll_cycles
+       SET status = 'draft',
+           rejected_by = $1,
+           rejected_at = NOW(),
+           rejection_reason = $2,
+           updated_at = NOW()
+       WHERE id = $3 AND tenant_id = $4
+       RETURNING *`,
+      [userId, rejectionReason || null, cycleId, tenantId]
+    );
+
+    return res.status(200).json({ 
+      message: "Payroll rejected and returned to draft",
+      payrollCycle: updateResult.rows[0]
+    });
+  } catch (e: any) {
+    console.error("Error rejecting payroll:", e);
+    return res.status(500).json({ error: e.message || "Failed to reject payroll" });
+  }
+});
+
 // Process payroll - generate payslips for all eligible employees (accepts edited items)
+// Now only works with approved cycles
 appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res) => {
   const userId = (req as any).userId as string;
   const tenantId = (req as any).tenantId as string;
@@ -1692,6 +2012,13 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
     }
 
     const cycle = cycleResult.rows[0];
+
+    // Only allow processing of approved cycles
+    if (cycle.status !== 'approved') {
+      return res.status(400).json({ 
+        error: `Cannot process payroll. Current status is '${cycle.status}'. Only 'approved' payroll can be processed. Please approve the payroll first.` 
+      });
+    }
     const payrollMonth = cycle.month;
     const payrollYear = cycle.year;
     const payrollMonthEnd = new Date(payrollYear, payrollMonth, 0); // Last day of the payroll month
@@ -1720,17 +2047,65 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
       [tenantId, payrollMonthEnd.toISOString()]
     );
 
-    // Check if edited payroll items are provided in request body
-    const { payrollItems: editedItems } = req.body;
+      // Check if edited payroll items are provided in request body
+      const { payrollItems: editedItems } = req.body;
 
-    // If edited items are provided, use them; otherwise calculate fresh
-    if (editedItems && Array.isArray(editedItems) && editedItems.length > 0) {
-      // Use the edited items provided
-      let processedCount = 0;
-      let totalGrossSalary = 0;
-      let totalDeductions = 0;
+      // If edited items are provided, use them; otherwise calculate fresh
+      if (editedItems && Array.isArray(editedItems) && editedItems.length > 0) {
+        // For approved cycles, prevent modifications to payroll items
+        // Once approved, payroll items should not be changed
+        if (cycle.status === 'approved') {
+          // Check if any items have changed
+          const existingItemsResult = await query(
+            "SELECT employee_id, gross_salary, basic_salary, hra, special_allowance FROM payroll_items WHERE payroll_cycle_id = $1 AND tenant_id = $2",
+            [cycleId, tenantId]
+          );
+          
+          // If items exist and are approved, don't allow edits - just process as-is
+          if (existingItemsResult.rows.length > 0) {
+            // Calculate totals from existing items
+            let processedCount = 0;
+            let totalGrossSalary = 0;
+            let totalDeductions = 0;
+            
+            for (const existingItem of existingItemsResult.rows) {
+              processedCount++;
+              totalGrossSalary += Number(existingItem.gross_salary || 0);
+              // Get deductions from existing item
+              const itemDeductions = await query(
+                "SELECT deductions FROM payroll_items WHERE payroll_cycle_id = $1 AND employee_id = $2 AND tenant_id = $3",
+                [cycleId, existingItem.employee_id, tenantId]
+              );
+              totalDeductions += Number(itemDeductions.rows[0]?.deductions || 0);
+            }
 
-      for (const item of editedItems) {
+            // Update cycle status to processing
+            await query(
+              `UPDATE payroll_cycles
+               SET status = 'processing',
+                   total_employees = $1,
+                   total_amount = $2,
+                   updated_at = NOW()
+               WHERE id = $3 AND tenant_id = $4`,
+              [processedCount, totalGrossSalary, cycleId, tenantId]
+            );
+
+            return res.status(200).json({
+              message: `Payroll processed successfully for ${processedCount} employees (approved payroll - no changes allowed)`,
+              processedCount,
+              totalGrossSalary,
+              totalDeductions,
+              totalNetSalary: totalGrossSalary - totalDeductions,
+            });
+          }
+        }
+
+        // Use the edited items provided (for draft cycles only)
+        let processedCount = 0;
+        let totalGrossSalary = 0;
+        let totalDeductions = 0;
+
+        for (const item of editedItems) {
         const {
           employee_id,
           basic_salary,
@@ -1739,7 +2114,28 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
           da = 0,
           lta = 0,
           bonus = 0,
+          lop_days,
+          paid_days,
+          total_working_days,
         } = item;
+
+        // If LOP days are provided, use them; otherwise calculate
+        let finalLopDays: number;
+        let finalPaidDays: number;
+        let finalTotalWorkingDays: number;
+
+        if (lop_days !== undefined && paid_days !== undefined && total_working_days !== undefined) {
+          // Use provided values
+          finalLopDays = Number(lop_days);
+          finalPaidDays = Number(paid_days);
+          finalTotalWorkingDays = Number(total_working_days);
+        } else {
+          // Calculate from database
+          const calculated = await calculateLopAndPaidDays(tenantId, employee_id, payrollMonth, payrollYear);
+          finalLopDays = calculated.lopDays;
+          finalPaidDays = calculated.paidDays;
+          finalTotalWorkingDays = calculated.totalWorkingDays;
+        }
 
         // Recalculate gross salary from edited components
         const editedGrossSalary = Number(basic_salary) + Number(hra) + Number(special_allowance) + Number(da) + Number(lta) + Number(bonus);
@@ -1760,13 +2156,29 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
         const netSalary = editedGrossSalary - calculatedDeductions;
 
         // Insert or update payroll item with edited values
+        // Only allow updates for draft cycles - approved/processing cycles are locked
+        const cycleStatusCheck = await query(
+          "SELECT status FROM payroll_cycles WHERE id = $1 AND tenant_id = $2",
+          [cycleId, tenantId]
+        );
+        
+        if (cycleStatusCheck.rows.length > 0) {
+          const currentStatus = cycleStatusCheck.rows[0].status;
+          if (['approved', 'processing', 'completed'].includes(currentStatus)) {
+            return res.status(400).json({ 
+              error: `Cannot modify payroll items. Current status is '${currentStatus}'. Only 'draft' or 'pending_approval' payroll can be modified.` 
+            });
+          }
+        }
+
         await query(
           `INSERT INTO payroll_items (
             tenant_id, payroll_cycle_id, employee_id,
             gross_salary, deductions, net_salary,
             basic_salary, hra, special_allowance,
-            pf_deduction, esi_deduction, tds_deduction, pt_deduction
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            pf_deduction, esi_deduction, tds_deduction, pt_deduction,
+            lop_days, paid_days, total_working_days
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
           ON CONFLICT (payroll_cycle_id, employee_id) DO UPDATE SET
             gross_salary = EXCLUDED.gross_salary,
             deductions = EXCLUDED.deductions,
@@ -1778,6 +2190,9 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
             esi_deduction = EXCLUDED.esi_deduction,
             tds_deduction = EXCLUDED.tds_deduction,
             pt_deduction = EXCLUDED.pt_deduction,
+            lop_days = EXCLUDED.lop_days,
+            paid_days = EXCLUDED.paid_days,
+            total_working_days = EXCLUDED.total_working_days,
             updated_at = NOW()`,
           [
             tenantId,
@@ -1793,6 +2208,9 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
             editedEsiDeduction,
             editedTdsDeduction,
             editedPtDeduction,
+            finalLopDays,
+            finalPaidDays,
+            finalTotalWorkingDays,
           ]
         );
 
@@ -1822,6 +2240,38 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
     }
 
     // Original logic: calculate fresh (for backward compatibility)
+    // For approved cycles, items should already exist - skip processing
+    if (cycle.status === 'approved') {
+      const existingItemsResult = await query(
+        "SELECT COUNT(*)::text as count, SUM(gross_salary)::text as total_gross, SUM(deductions)::text as total_deductions FROM payroll_items WHERE payroll_cycle_id = $1 AND tenant_id = $2",
+        [cycleId, tenantId]
+      );
+      
+      if (existingItemsResult.rows.length > 0 && parseInt(existingItemsResult.rows[0]?.count || '0', 10) > 0) {
+        const processedCount = parseInt(existingItemsResult.rows[0]?.count || '0', 10);
+        const totalGrossSalary = parseFloat(existingItemsResult.rows[0]?.total_gross || '0');
+        const totalDeductions = parseFloat(existingItemsResult.rows[0]?.total_deductions || '0');
+
+        await query(
+          `UPDATE payroll_cycles
+           SET status = 'processing',
+               total_employees = $1,
+               total_amount = $2,
+               updated_at = NOW()
+           WHERE id = $3 AND tenant_id = $4`,
+          [processedCount, totalGrossSalary, cycleId, tenantId]
+        );
+
+        return res.status(200).json({
+          message: `Payroll processed successfully for ${processedCount} employees (approved payroll - using existing items)`,
+          processedCount,
+          totalGrossSalary,
+          totalDeductions,
+          totalNetSalary: totalGrossSalary - totalDeductions,
+        });
+      }
+    }
+
     const employees = employeesResult.rows;
     let processedCount = 0;
     let totalGrossSalary = 0;
@@ -1858,18 +2308,36 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
       // Gross salary = sum of all monthly earnings
       const grossSalary = monthlyBasic + monthlyHRA + monthlySpecialAllowance + monthlyDA + monthlyLTA + monthlyBonus;
 
-      // Calculate deductions
+      // Calculate LOP days and paid days for this month
+      const { lopDays, paidDays, totalWorkingDays } = await calculateLopAndPaidDays(
+        tenantId,
+        employee.id,
+        payrollMonth,
+        payrollYear
+      );
+
+      // Adjust gross salary based on paid days (proportional deduction for LOP)
+      const dailyRate = grossSalary / totalWorkingDays;
+      const adjustedGrossSalary = dailyRate * paidDays;
+
+      // Recalculate components proportionally
+      const adjustmentRatio = paidDays / totalWorkingDays;
+      const adjustedBasic = monthlyBasic * adjustmentRatio;
+      const adjustedHRA = monthlyHRA * adjustmentRatio;
+      const adjustedSpecialAllowance = monthlySpecialAllowance * adjustmentRatio;
+
+      // Calculate deductions based on adjusted gross
       // PF: 12% of basic (employee contribution)
-      const pfDeduction = (monthlyBasic * Number(settings.pf_rate)) / 100;
+      const pfDeduction = (adjustedBasic * Number(settings.pf_rate)) / 100;
       
       // ESI: 0.75% of gross if gross <= 21000 (employee contribution)
-      const esiDeduction = grossSalary <= 21000 ? (grossSalary * 0.75) / 100 : 0;
+      const esiDeduction = adjustedGrossSalary <= 21000 ? (adjustedGrossSalary * 0.75) / 100 : 0;
       
       // Professional Tax: Fixed amount from settings
       const ptDeduction = Number(settings.pt_rate) || 200;
       
       // TDS: Calculate based on annual income (simplified - 5% if annual > threshold)
-      const annualIncome = grossSalary * 12;
+      const annualIncome = adjustedGrossSalary * 12;
       let tdsDeduction = 0;
       if (annualIncome > Number(settings.tds_threshold)) {
         // Simplified TDS calculation - 5% of excess over threshold
@@ -1878,16 +2346,24 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
       }
 
       const totalDeductionsForEmployee = pfDeduction + esiDeduction + ptDeduction + tdsDeduction;
-      const netSalary = grossSalary - totalDeductionsForEmployee;
+      const netSalary = adjustedGrossSalary - totalDeductionsForEmployee;
 
       // Insert payroll item
+      // Only allow inserts/updates for draft and pending_approval cycles
+      // Approved/processing/completed cycles are locked
+      if (['approved', 'processing', 'completed'].includes(cycle.status)) {
+        // Skip this employee - cannot modify approved payroll
+        continue;
+      }
+
       await query(
         `INSERT INTO payroll_items (
           tenant_id, payroll_cycle_id, employee_id,
           gross_salary, deductions, net_salary,
           basic_salary, hra, special_allowance,
-          pf_deduction, esi_deduction, tds_deduction, pt_deduction
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          pf_deduction, esi_deduction, tds_deduction, pt_deduction,
+          lop_days, paid_days, total_working_days
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT (payroll_cycle_id, employee_id) DO UPDATE SET
           gross_salary = EXCLUDED.gross_salary,
           deductions = EXCLUDED.deductions,
@@ -1899,26 +2375,32 @@ appRouter.post("/payroll-cycles/:cycleId/process", requireAuth, async (req, res)
           esi_deduction = EXCLUDED.esi_deduction,
           tds_deduction = EXCLUDED.tds_deduction,
           pt_deduction = EXCLUDED.pt_deduction,
+          lop_days = EXCLUDED.lop_days,
+          paid_days = EXCLUDED.paid_days,
+          total_working_days = EXCLUDED.total_working_days,
           updated_at = NOW()`,
         [
           tenantId,
           cycleId,
           employee.id,
-          grossSalary,
+          adjustedGrossSalary,
           totalDeductionsForEmployee,
           netSalary,
-          monthlyBasic,
-          monthlyHRA,
-          monthlySpecialAllowance,
+          adjustedBasic,
+          adjustedHRA,
+          adjustedSpecialAllowance,
           pfDeduction,
           esiDeduction,
           tdsDeduction,
           ptDeduction,
+          lopDays,
+          paidDays,
+          totalWorkingDays,
         ]
       );
 
       processedCount++;
-      totalGrossSalary += grossSalary;
+      totalGrossSalary += adjustedGrossSalary;
       totalDeductions += totalDeductionsForEmployee;
     }
 
@@ -2043,6 +2525,623 @@ appRouter.post("/payroll-settings", requireAuth, async (req: Request, res: Respo
   } catch (error) {
     console.error("Error saving payroll settings:", error);
     return res.status(500).json({ error: "Failed to save settings" });
+  }
+});
+
+// ========== LEAVE MANAGEMENT ENDPOINTS ==========
+
+// Get my leave requests (employee self-service)
+appRouter.get("/leave-requests/me", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const email = (req as any).userEmail as string;
+    const status = req.query.status as string | undefined;
+    const month = req.query.month ? parseInt(req.query.month as string) : undefined;
+    const year = req.query.year ? parseInt(req.query.year as string) : undefined;
+
+    // Get employee ID from email
+    const empResult = await query<{ id: string }>(
+      "SELECT id FROM employees WHERE tenant_id = $1 AND email = $2 LIMIT 1",
+      [tenantId, email]
+    );
+
+    if (!empResult.rows[0]) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    let sqlQuery = `
+      SELECT 
+        lr.*,
+        e.full_name as employee_name,
+        e.employee_code,
+        approver.full_name as approver_name,
+        creator.full_name as creator_name
+      FROM leave_requests lr
+      JOIN employees e ON lr.employee_id = e.id
+      LEFT JOIN profiles approver ON lr.approved_by = approver.id OR lr.rejected_by = approver.id
+      LEFT JOIN profiles creator ON lr.created_by = creator.id
+      WHERE lr.tenant_id = $1 AND lr.employee_id = $2
+    `;
+    const params: any[] = [tenantId, employeeId];
+    let paramIndex = 3;
+
+    if (status) {
+      sqlQuery += ` AND lr.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+
+    if (month && year) {
+      sqlQuery += ` AND (
+        (EXTRACT(YEAR FROM lr.start_date) = $${paramIndex} AND EXTRACT(MONTH FROM lr.start_date) = $${paramIndex + 1}) OR
+        (EXTRACT(YEAR FROM lr.end_date) = $${paramIndex} AND EXTRACT(MONTH FROM lr.end_date) = $${paramIndex + 1}) OR
+        (lr.start_date <= DATE '${year}-${month}-01' AND lr.end_date >= DATE '${year}-${month}-01')
+      )`;
+      params.push(year, month);
+      paramIndex += 2;
+    }
+
+    sqlQuery += " ORDER BY lr.created_at DESC";
+
+    const result = await query(sqlQuery, params);
+    return res.json({ leaveRequests: result.rows });
+  } catch (e: any) {
+    console.error("Error fetching my leave requests:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch leave requests" });
+  }
+});
+
+// Create leave request (employee self-service)
+appRouter.post("/leave-requests/me", requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId as string;
+    const tenantId = (req as any).tenantId as string;
+    const email = (req as any).userEmail as string;
+    const { leaveType, startDate, endDate, reason } = req.body;
+
+    if (!leaveType || !startDate || !endDate) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Get employee ID from email
+    const empResult = await query<{ id: string }>(
+      "SELECT id FROM employees WHERE tenant_id = $1 AND email = $2 LIMIT 1",
+      [tenantId, email]
+    );
+
+    if (!empResult.rows[0]) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Calculate days (including fractional days for half-days)
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const timeDiff = end.getTime() - start.getTime();
+    const daysDiff = Math.ceil(timeDiff / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
+
+    const result = await query(
+      `INSERT INTO leave_requests (
+        tenant_id, employee_id, leave_type, start_date, end_date, days, reason, status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *`,
+      [tenantId, employeeId, leaveType, startDate, endDate, daysDiff, reason || null, 'pending', userId]
+    );
+
+    return res.status(201).json({ leaveRequest: result.rows[0] });
+  } catch (e: any) {
+    console.error("Error creating leave request:", e);
+    res.status(500).json({ error: e.message || "Failed to create leave request" });
+  }
+});
+
+// Get all leave requests (with optional filters) - Admin/HR view
+appRouter.get("/leave-requests", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const employeeId = req.query.employeeId as string | undefined;
+    const status = req.query.status as string | undefined;
+    const month = req.query.month ? parseInt(req.query.month as string) : undefined;
+    const year = req.query.year ? parseInt(req.query.year as string) : undefined;
+
+    let sqlQuery = `
+      SELECT 
+        lr.*,
+        e.full_name as employee_name,
+        e.employee_code,
+        approver.full_name as approver_name,
+        creator.full_name as creator_name
+      FROM leave_requests lr
+      JOIN employees e ON lr.employee_id = e.id
+      LEFT JOIN profiles approver ON lr.approved_by = approver.id OR lr.rejected_by = approver.id
+      LEFT JOIN profiles creator ON lr.created_by = creator.id
+      WHERE lr.tenant_id = $1
+    `;
+    const params: any[] = [tenantId];
+    let paramIndex = 2;
+
+    if (employeeId) {
+      sqlQuery += ` AND lr.employee_id = $${paramIndex}`;
+      params.push(employeeId);
+      paramIndex++;
+    }
+
+    if (status) {
+      sqlQuery += ` AND lr.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+
+    if (month && year) {
+      sqlQuery += ` AND (
+        (EXTRACT(YEAR FROM lr.start_date) = $${paramIndex} AND EXTRACT(MONTH FROM lr.start_date) = $${paramIndex + 1}) OR
+        (EXTRACT(YEAR FROM lr.end_date) = $${paramIndex} AND EXTRACT(MONTH FROM lr.end_date) = $${paramIndex + 1}) OR
+        (lr.start_date <= DATE '${year}-${month}-01' AND lr.end_date >= DATE '${year}-${month}-01')
+      )`;
+      params.push(year, month);
+      paramIndex += 2;
+    }
+
+    sqlQuery += " ORDER BY lr.created_at DESC";
+
+    const result = await query(sqlQuery, params);
+    return res.json({ leaveRequests: result.rows });
+  } catch (e: any) {
+    console.error("Error fetching leave requests:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch leave requests" });
+  }
+});
+
+// Get leave request by ID
+appRouter.get("/leave-requests/:leaveRequestId", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const { leaveRequestId } = req.params;
+
+    const result = await query(
+      `SELECT 
+        lr.*,
+        e.full_name as employee_name,
+        e.employee_code,
+        approver.full_name as approver_name,
+        creator.full_name as creator_name
+      FROM leave_requests lr
+      JOIN employees e ON lr.employee_id = e.id
+      LEFT JOIN profiles approver ON lr.approved_by = approver.id OR lr.rejected_by = approver.id
+      LEFT JOIN profiles creator ON lr.created_by = creator.id
+      WHERE lr.id = $1 AND lr.tenant_id = $2`,
+      [leaveRequestId, tenantId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Leave request not found" });
+    }
+
+    return res.json({ leaveRequest: result.rows[0] });
+  } catch (e: any) {
+    console.error("Error fetching leave request:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch leave request" });
+  }
+});
+
+// Create leave request
+appRouter.post("/leave-requests", requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId as string;
+    const tenantId = (req as any).tenantId as string;
+    const { employeeId, leaveType, startDate, endDate, reason } = req.body;
+
+    if (!employeeId || !leaveType || !startDate || !endDate) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Calculate days (including fractional days for half-days)
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const timeDiff = end.getTime() - start.getTime();
+    const daysDiff = Math.ceil(timeDiff / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end dates
+
+    const result = await query(
+      `INSERT INTO leave_requests (
+        tenant_id, employee_id, leave_type, start_date, end_date, days, reason, status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *`,
+      [tenantId, employeeId, leaveType, startDate, endDate, daysDiff, reason || null, 'pending', userId]
+    );
+
+    return res.status(201).json({ leaveRequest: result.rows[0] });
+  } catch (e: any) {
+    console.error("Error creating leave request:", e);
+    res.status(500).json({ error: e.message || "Failed to create leave request" });
+  }
+});
+
+// Update leave request status (approve/reject)
+appRouter.patch("/leave-requests/:leaveRequestId/status", requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId as string;
+    const tenantId = (req as any).tenantId as string;
+    const { leaveRequestId } = req.params;
+    const { status, rejectionReason } = req.body;
+
+    if (!status || !['approved', 'rejected', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    let updateQuery = '';
+    const params: any[] = [tenantId, leaveRequestId, status];
+
+    if (status === 'approved') {
+      updateQuery = `
+        UPDATE leave_requests 
+        SET status = $3, approved_by = $4, approved_at = NOW(), updated_at = NOW()
+        WHERE tenant_id = $1 AND id = $2
+        RETURNING *
+      `;
+      params.push(userId);
+    } else if (status === 'rejected') {
+      updateQuery = `
+        UPDATE leave_requests 
+        SET status = $3, rejected_by = $4, rejected_at = NOW(), rejection_reason = $5, updated_at = NOW()
+        WHERE tenant_id = $1 AND id = $2
+        RETURNING *
+      `;
+      params.push(userId, rejectionReason || null);
+    } else {
+      updateQuery = `
+        UPDATE leave_requests 
+        SET status = $3, updated_at = NOW()
+        WHERE tenant_id = $1 AND id = $2
+        RETURNING *
+      `;
+    }
+
+    const result = await query(updateQuery, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Leave request not found" });
+    }
+
+    return res.json({ leaveRequest: result.rows[0] });
+  } catch (e: any) {
+    console.error("Error updating leave request status:", e);
+    res.status(500).json({ error: e.message || "Failed to update leave request status" });
+  }
+});
+
+// Get my leave summary (employee self-service)
+appRouter.get("/leave-summary/me", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const email = (req as any).userEmail as string;
+    const month = req.query.month ? parseInt(req.query.month as string) : new Date().getMonth() + 1;
+    const year = req.query.year ? parseInt(req.query.year as string) : new Date().getFullYear();
+
+    // Get employee ID from email
+    const empResult = await query<{ id: string }>(
+      "SELECT id FROM employees WHERE tenant_id = $1 AND email = $2 LIMIT 1",
+      [tenantId, email]
+    );
+
+    if (!empResult.rows[0]) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    // Get approved leave requests for the month
+    const leaveResult = await query(
+      `SELECT 
+        SUM(CASE WHEN leave_type = 'loss_of_pay' THEN days ELSE 0 END) as lop_days,
+        SUM(CASE WHEN leave_type = 'sick' THEN days ELSE 0 END) as sick_leave_days,
+        SUM(CASE WHEN leave_type = 'casual' THEN days ELSE 0 END) as casual_leave_days,
+        SUM(CASE WHEN leave_type != 'loss_of_pay' THEN days ELSE 0 END) as paid_leave_days,
+        SUM(days) as total_leave_days
+      FROM leave_requests
+      WHERE tenant_id = $1 
+        AND employee_id = $2
+        AND status = 'approved'
+        AND (
+          (EXTRACT(YEAR FROM start_date) = $3 AND EXTRACT(MONTH FROM start_date) = $4) OR
+          (EXTRACT(YEAR FROM end_date) = $3 AND EXTRACT(MONTH FROM end_date) = $4) OR
+          (start_date <= DATE '${year}-${month}-01' AND end_date >= DATE '${year}-${month}-01')
+        )`,
+      [tenantId, employeeId, year, month]
+    );
+
+    // Get LOP days from attendance records
+    const attendanceResult = await query(
+      `SELECT 
+        COUNT(*) as lop_days_from_attendance
+      FROM attendance_records
+      WHERE tenant_id = $1 
+        AND employee_id = $2
+        AND is_lop = true
+        AND EXTRACT(YEAR FROM attendance_date) = $3
+        AND EXTRACT(MONTH FROM attendance_date) = $4`,
+      [tenantId, employeeId, year, month]
+    );
+
+    const leaveData = leaveResult.rows[0] || { 
+      lop_days: 0, 
+      sick_leave_days: 0,
+      casual_leave_days: 0,
+      paid_leave_days: 0, 
+      total_leave_days: 0 
+    };
+    const attendanceLop = parseInt(attendanceResult.rows[0]?.lop_days_from_attendance || '0', 10);
+
+    // Calculate total LOP days (from leave requests + attendance records)
+    const totalLopDays = Number(leaveData.lop_days || 0) + attendanceLop;
+
+    // Calculate working days in the month
+    const daysInMonth = new Date(year, month, 0).getDate();
+    
+    // Calculate paid days (working days - LOP days)
+    const paidDays = daysInMonth - totalLopDays;
+
+    return res.json({
+      month,
+      year,
+      totalWorkingDays: daysInMonth,
+      lopDays: totalLopDays,
+      paidDays: Math.max(0, paidDays),
+      sickLeaveDays: Number(leaveData.sick_leave_days || 0),
+      casualLeaveDays: Number(leaveData.casual_leave_days || 0),
+      paidLeaveDays: Number(leaveData.paid_leave_days || 0),
+      totalLeaveDays: Number(leaveData.total_leave_days || 0)
+    });
+  } catch (e: any) {
+    console.error("Error fetching leave summary:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch leave summary" });
+  }
+});
+
+// Get leave summary for an employee for a specific month/year (Admin/HR view)
+appRouter.get("/employees/:employeeId/leave-summary", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const { employeeId } = req.params;
+    const month = req.query.month ? parseInt(req.query.month as string) : new Date().getMonth() + 1;
+    const year = req.query.year ? parseInt(req.query.year as string) : new Date().getFullYear();
+
+    // Get approved leave requests for the month
+    const leaveResult = await query(
+      `SELECT 
+        SUM(CASE WHEN leave_type = 'loss_of_pay' THEN days ELSE 0 END) as lop_days,
+        SUM(CASE WHEN leave_type != 'loss_of_pay' THEN days ELSE 0 END) as paid_leave_days,
+        SUM(days) as total_leave_days
+      FROM leave_requests
+      WHERE tenant_id = $1 
+        AND employee_id = $2
+        AND status = 'approved'
+        AND (
+          (EXTRACT(YEAR FROM start_date) = $3 AND EXTRACT(MONTH FROM start_date) = $4) OR
+          (EXTRACT(YEAR FROM end_date) = $3 AND EXTRACT(MONTH FROM end_date) = $4) OR
+          (start_date <= DATE '${year}-${month}-01' AND end_date >= DATE '${year}-${month}-01')
+        )`,
+      [tenantId, employeeId, year, month]
+    );
+
+    // Get LOP days from attendance records
+    const attendanceResult = await query(
+      `SELECT 
+        COUNT(*) as lop_days_from_attendance
+      FROM attendance_records
+      WHERE tenant_id = $1 
+        AND employee_id = $2
+        AND is_lop = true
+        AND EXTRACT(YEAR FROM attendance_date) = $3
+        AND EXTRACT(MONTH FROM attendance_date) = $4`,
+      [tenantId, employeeId, year, month]
+    );
+
+    const leaveData = leaveResult.rows[0] || { lop_days: 0, paid_leave_days: 0, total_leave_days: 0 };
+    const attendanceLop = parseInt(attendanceResult.rows[0]?.lop_days_from_attendance || '0', 10);
+
+    // Calculate total LOP days (from leave requests + attendance records)
+    const totalLopDays = Number(leaveData.lop_days || 0) + attendanceLop;
+
+    // Calculate working days in the month
+    const daysInMonth = new Date(year, month, 0).getDate();
+    
+    // Calculate paid days (working days - LOP days)
+    const paidDays = daysInMonth - totalLopDays;
+
+    return res.json({
+      month,
+      year,
+      totalWorkingDays: daysInMonth,
+      lopDays: totalLopDays,
+      paidDays: Math.max(0, paidDays),
+      paidLeaveDays: Number(leaveData.paid_leave_days || 0),
+      totalLeaveDays: Number(leaveData.total_leave_days || 0)
+    });
+  } catch (e: any) {
+    console.error("Error fetching leave summary:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch leave summary" });
+  }
+});
+
+// ========== ATTENDANCE MANAGEMENT ENDPOINTS ==========
+
+// Get my attendance records (employee self-service)
+appRouter.get("/attendance/me", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const email = (req as any).userEmail as string;
+    const month = req.query.month ? parseInt(req.query.month as string) : undefined;
+    const year = req.query.year ? parseInt(req.query.year as string) : undefined;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    // Get employee ID from email
+    const empResult = await query<{ id: string }>(
+      "SELECT id FROM employees WHERE tenant_id = $1 AND email = $2 LIMIT 1",
+      [tenantId, email]
+    );
+
+    if (!empResult.rows[0]) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+
+    const employeeId = empResult.rows[0].id;
+
+    let sqlQuery = `
+      SELECT 
+        ar.*,
+        e.full_name as employee_name,
+        e.employee_code
+      FROM attendance_records ar
+      JOIN employees e ON ar.employee_id = e.id
+      WHERE ar.tenant_id = $1 AND ar.employee_id = $2
+    `;
+    const params: any[] = [tenantId, employeeId];
+    let paramIndex = 3;
+
+    if (month && year) {
+      sqlQuery += ` AND EXTRACT(YEAR FROM ar.attendance_date) = $${paramIndex} AND EXTRACT(MONTH FROM ar.attendance_date) = $${paramIndex + 1}`;
+      params.push(year, month);
+      paramIndex += 2;
+    } else if (startDate && endDate) {
+      sqlQuery += ` AND ar.attendance_date >= $${paramIndex} AND ar.attendance_date <= $${paramIndex + 1}`;
+      params.push(startDate, endDate);
+      paramIndex += 2;
+    }
+
+    sqlQuery += " ORDER BY ar.attendance_date DESC";
+
+    const result = await query(sqlQuery, params);
+    return res.json({ attendanceRecords: result.rows });
+  } catch (e: any) {
+    console.error("Error fetching my attendance records:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch attendance records" });
+  }
+});
+
+// Get attendance records (Admin/HR view)
+appRouter.get("/attendance", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const employeeId = req.query.employeeId as string | undefined;
+    const month = req.query.month ? parseInt(req.query.month as string) : undefined;
+    const year = req.query.year ? parseInt(req.query.year as string) : undefined;
+    const startDate = req.query.startDate as string | undefined;
+    const endDate = req.query.endDate as string | undefined;
+
+    let sqlQuery = `
+      SELECT 
+        ar.*,
+        e.full_name as employee_name,
+        e.employee_code
+      FROM attendance_records ar
+      JOIN employees e ON ar.employee_id = e.id
+      WHERE ar.tenant_id = $1
+    `;
+    const params: any[] = [tenantId];
+    let paramIndex = 2;
+
+    if (employeeId) {
+      sqlQuery += ` AND ar.employee_id = $${paramIndex}`;
+      params.push(employeeId);
+      paramIndex++;
+    }
+
+    if (month && year) {
+      sqlQuery += ` AND EXTRACT(YEAR FROM ar.attendance_date) = $${paramIndex} AND EXTRACT(MONTH FROM ar.attendance_date) = $${paramIndex + 1}`;
+      params.push(year, month);
+      paramIndex += 2;
+    } else if (startDate && endDate) {
+      sqlQuery += ` AND ar.attendance_date >= $${paramIndex} AND ar.attendance_date <= $${paramIndex + 1}`;
+      params.push(startDate, endDate);
+      paramIndex += 2;
+    }
+
+    sqlQuery += " ORDER BY ar.attendance_date DESC, e.full_name ASC";
+
+    const result = await query(sqlQuery, params);
+    return res.json({ attendanceRecords: result.rows });
+  } catch (e: any) {
+    console.error("Error fetching attendance records:", e);
+    res.status(500).json({ error: e.message || "Failed to fetch attendance records" });
+  }
+});
+
+// Create or update attendance record
+appRouter.post("/attendance", requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId as string;
+    const tenantId = (req as any).tenantId as string;
+    const { employeeId, attendanceDate, status, isLop, remarks } = req.body;
+
+    if (!employeeId || !attendanceDate || !status) {
+      return res.status(400).json({ error: "Missing required fields: employeeId, attendanceDate, status" });
+    }
+
+    const result = await query(
+      `INSERT INTO attendance_records (
+        tenant_id, employee_id, attendance_date, status, is_lop, remarks, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (tenant_id, employee_id, attendance_date) 
+      DO UPDATE SET
+        status = EXCLUDED.status,
+        is_lop = EXCLUDED.is_lop,
+        remarks = EXCLUDED.remarks,
+        updated_at = NOW()
+      RETURNING *`,
+      [tenantId, employeeId, attendanceDate, status, isLop || false, remarks || null, userId]
+    );
+
+    return res.status(201).json({ attendanceRecord: result.rows[0] });
+  } catch (e: any) {
+    console.error("Error creating/updating attendance record:", e);
+    res.status(500).json({ error: e.message || "Failed to create/update attendance record" });
+  }
+});
+
+// Bulk create attendance records
+appRouter.post("/attendance/bulk", requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId as string;
+    const tenantId = (req as any).tenantId as string;
+    const { records } = req.body; // Array of { employeeId, attendanceDate, status, isLop, remarks }
+
+    if (!Array.isArray(records) || records.length === 0) {
+      return res.status(400).json({ error: "records must be a non-empty array" });
+    }
+
+    const results = [];
+    for (const record of records) {
+      const { employeeId, attendanceDate, status, isLop, remarks } = record;
+      
+      if (!employeeId || !attendanceDate || !status) {
+        continue; // Skip invalid records
+      }
+
+      const result = await query(
+        `INSERT INTO attendance_records (
+          tenant_id, employee_id, attendance_date, status, is_lop, remarks, created_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (tenant_id, employee_id, attendance_date) 
+        DO UPDATE SET
+          status = EXCLUDED.status,
+          is_lop = EXCLUDED.is_lop,
+          remarks = EXCLUDED.remarks,
+          updated_at = NOW()
+        RETURNING *`,
+        [tenantId, employeeId, attendanceDate, status, isLop || false, remarks || null, userId]
+      );
+
+      results.push(result.rows[0]);
+    }
+
+    return res.status(201).json({ attendanceRecords: results, count: results.length });
+  } catch (e: any) {
+    console.error("Error bulk creating attendance records:", e);
+    res.status(500).json({ error: e.message || "Failed to bulk create attendance records" });
   }
 });
 

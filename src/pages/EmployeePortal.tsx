@@ -13,6 +13,8 @@ import { EmployeeSalaryStructure } from "@/components/employees/EmployeeSalarySt
 import { PayslipsTab } from "@/components/employee-portal/PayslipsTab";
 import { TaxDeclarationsTab } from "@/components/employee-portal/TaxDeclarationsTab";
 import { TaxDocumentsTab } from "@/components/employee-portal/TaxDocumentsTab";
+import { LeaveRequestsTab } from "@/components/employee-portal/LeaveRequestsTab";
+import { AttendanceTab } from "@/components/employee-portal/AttendanceTab";
 
 const EmployeePortal = () => {
   const navigate = useNavigate();
@@ -96,10 +98,12 @@ const EmployeePortal = () => {
           </Card>
         ) : (
           <Tabs defaultValue="overview" className="w-full">
-            <TabsList className="grid w-full grid-cols-5">
+            <TabsList className="grid w-full grid-cols-7">
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="salary">Salary</TabsTrigger>
               <TabsTrigger value="payslips">Payslips</TabsTrigger>
+              <TabsTrigger value="leaves">Leaves</TabsTrigger>
+              <TabsTrigger value="attendance">Attendance</TabsTrigger>
               <TabsTrigger value="declarations">Declarations</TabsTrigger>
               <TabsTrigger value="documents">Documents</TabsTrigger>
             </TabsList>
@@ -154,6 +158,14 @@ const EmployeePortal = () => {
 
             <TabsContent value="payslips">
               <PayslipsTab />
+            </TabsContent>
+
+            <TabsContent value="leaves">
+              <LeaveRequestsTab />
+            </TabsContent>
+
+            <TabsContent value="attendance">
+              <AttendanceTab />
             </TabsContent>
 
             <TabsContent value="declarations">
