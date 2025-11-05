@@ -3145,3 +3145,146 @@ appRouter.post("/attendance/bulk", requireAuth, async (req, res) => {
   }
 });
 
+// Payroll Register CSV Report
+appRouter.get("/reports/payroll-register", requireAuth, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const { cycleId } = req.query;
+
+    if (!cycleId || typeof cycleId !== "string") {
+      return res.status(400).json({ error: "cycleId query parameter is required" });
+    }
+
+    // Verify cycle belongs to tenant
+    const cycleCheck = await query<{ month: number; year: number }>(
+      "SELECT month, year FROM payroll_cycles WHERE id = $1 AND tenant_id = $2",
+      [cycleId, tenantId]
+    );
+
+    if (cycleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Payroll cycle not found" });
+    }
+
+    const cycle = cycleCheck.rows[0];
+    const monthName = new Date(2000, cycle.month - 1).toLocaleString('en-IN', { month: 'long' });
+
+    // Fetch payroll items with employee details
+    const payrollItems = await query(
+      `
+      SELECT 
+        e.employee_code,
+        e.full_name,
+        e.pan_number,
+        e.bank_account_number,
+        pi.basic_salary,
+        pi.hra,
+        pi.special_allowance,
+        pi.gross_salary,
+        pi.pf_deduction,
+        pi.esi_deduction,
+        pi.tds_deduction,
+        pi.pt_deduction,
+        pi.deductions,
+        pi.net_salary,
+        pi.lop_days,
+        pi.paid_days,
+        pi.total_working_days
+      FROM payroll_items pi
+      JOIN employees e ON pi.employee_id = e.id
+      WHERE pi.payroll_cycle_id = $1
+        AND pi.tenant_id = $2
+      ORDER BY e.employee_code ASC
+      `,
+      [cycleId, tenantId]
+    );
+
+    if (payrollItems.rows.length === 0) {
+      return res.status(404).json({ error: "No payroll data found for this cycle" });
+    }
+
+    // Generate CSV
+    const headers = [
+      "Employee Code",
+      "Employee Name",
+      "PAN Number",
+      "Bank Account Number",
+      "Basic Salary",
+      "HRA",
+      "Special Allowance",
+      "Gross Salary",
+      "PF Deduction",
+      "ESI Deduction",
+      "TDS Deduction",
+      "PT Deduction",
+      "Total Deductions",
+      "Net Salary",
+      "LOP Days",
+      "Paid Days",
+      "Total Working Days"
+    ];
+
+    // Helper function to escape CSV values
+    const escapeCSV = (value: any): string => {
+      if (value === null || value === undefined) {
+        return "";
+      }
+      const str = String(value);
+      // If contains comma, newline, or quote, wrap in quotes and escape quotes
+      if (str.includes(",") || str.includes("\n") || str.includes('"')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    // Helper function to format currency (as number without currency symbol)
+    const formatCurrency = (amount: number | null | undefined): string => {
+      if (amount === null || amount === undefined) {
+        return "0.00";
+      }
+      return Number(amount).toFixed(2);
+    };
+
+    // Build CSV rows
+    const csvRows = [headers.map(escapeCSV).join(",")];
+
+    for (const row of payrollItems.rows) {
+      const csvRow = [
+        escapeCSV(row.employee_code || ""),
+        escapeCSV(row.full_name || ""),
+        escapeCSV(row.pan_number || ""),
+        escapeCSV(row.bank_account_number || ""),
+        formatCurrency(row.basic_salary),
+        formatCurrency(row.hra),
+        formatCurrency(row.special_allowance),
+        formatCurrency(row.gross_salary),
+        formatCurrency(row.pf_deduction),
+        formatCurrency(row.esi_deduction),
+        formatCurrency(row.tds_deduction),
+        formatCurrency(row.pt_deduction),
+        formatCurrency(row.deductions),
+        formatCurrency(row.net_salary),
+        escapeCSV(row.lop_days || 0),
+        escapeCSV(row.paid_days || 0),
+        escapeCSV(row.total_working_days || 0)
+      ];
+      csvRows.push(csvRow.join(","));
+    }
+
+    const csvContent = csvRows.join("\n");
+
+    // Set response headers for CSV download
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payroll-register-${monthName}-${cycle.year}.csv"`
+    );
+
+    // Send CSV content
+    res.send(csvContent);
+
+  } catch (e: any) {
+    console.error("Error generating payroll register report:", e);
+    res.status(500).json({ error: e.message || "Failed to generate payroll register report" });
+  }
+});
+

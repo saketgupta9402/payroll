@@ -261,5 +261,41 @@ export const api = {
       return client.get<{ attendanceRecords: any[] }>(`/api/attendance/me${queryString ? `?${queryString}` : ""}`);
     },
   },
+
+  // --- Reports ---
+  reports: {
+    getPayrollRegister: async (cycleId: string) => {
+      const response = await fetch(`${import.meta.env.VITE_API_URL || "http://localhost:4000"}/api/reports/payroll-register?cycleId=${cycleId}`, {
+        method: "GET",
+        credentials: "include", // Include cookies for authentication
+      });
+      
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: "Failed to download payroll register" }));
+        throw new Error(error.error || "Failed to download payroll register");
+      }
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      
+      // Extract filename from Content-Disposition header if available
+      const contentDisposition = response.headers.get("Content-Disposition");
+      let filename = `payroll-register-${cycleId}.csv`;
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/);
+        if (filenameMatch) {
+          filename = filenameMatch[1];
+        }
+      }
+      
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    },
+  },
 };
 
