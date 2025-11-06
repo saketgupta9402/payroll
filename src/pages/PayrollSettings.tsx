@@ -48,9 +48,13 @@ const PayrollSettings = () => {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const session = await api.auth.session();
-        if (!session?.session) {
-          navigate("/auth");
+        // Check for session and PIN cookies (cookie-based auth)
+        const cookies = document.cookie || "";
+        const hasSession = /(?:^|; )session=/.test(cookies);
+        const hasPinOk = /(?:^|; )pin_ok=/.test(cookies);
+        
+        if (!hasSession || !hasPinOk) {
+          navigate("/pin-auth");
           return;
         }
 

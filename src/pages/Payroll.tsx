@@ -31,9 +31,13 @@ const Payroll = () => {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const session = await api.auth.session();
-        if (!session?.session) {
-          navigate("/auth");
+        // Check for session and PIN cookies (cookie-based auth)
+        const cookies = document.cookie || "";
+        const hasSession = /(?:^|; )session=/.test(cookies);
+        const hasPinOk = /(?:^|; )pin_ok=/.test(cookies);
+        
+        if (!hasSession || !hasPinOk) {
+          navigate("/pin-auth");
           return;
         }
 
@@ -48,11 +52,11 @@ const Payroll = () => {
           if (me?.employee) {
             navigate("/employee-portal"); // Redirect to employee portal
           } else {
-            navigate("/auth"); // No valid role found
+            navigate("/pin-auth"); // No valid role found
           }
         }
       } catch (error) {
-        navigate("/auth");
+        navigate("/pin-auth");
       }
     };
 

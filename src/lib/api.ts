@@ -3,6 +3,9 @@ const API_URL = "http://localhost:4000";
 const ABSOLUTE_URL_REGEX = /^https?:\/\//i;
 const NO_PREFIX_PATHS = ["/auth", "/health"];
 
+// Cache TTL for profile endpoint (2 seconds)
+const CACHE_TTL = 2000;
+
 const resolveEndpoint = (endpoint: string) => {
   if (ABSOLUTE_URL_REGEX.test(endpoint)) {
     return endpoint;
@@ -24,8 +27,50 @@ const resolveEndpoint = (endpoint: string) => {
  * `credentials: "include"` is the most important part, as it sends
  * the 'session' cookie to your backend for authentication.
  */
+let profileCache: { data: any; timestamp: number } | null = null;
+let profileRequestInFlight: Promise<any> | null = null;
+
 const client = {
   get: async <T>(endpoint: string): Promise<T> => {
+    // Special handling for profile endpoint to prevent duplicate requests
+    if (endpoint === "/api/profile") {
+      // If there's a request in flight, wait for it
+      if (profileRequestInFlight) {
+        return profileRequestInFlight as Promise<T>;
+      }
+      
+      // Check cache
+      if (profileCache && Date.now() - profileCache.timestamp < CACHE_TTL) {
+        return profileCache.data as T;
+      }
+      
+      // Make the request and cache it
+      profileRequestInFlight = fetch(resolveEndpoint(endpoint), {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }).then(async (response) => {
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ error: "API error" }));
+          throw new Error(errorData.error || `API error: ${response.statusText}`);
+        }
+        const data = response.json();
+        profileRequestInFlight = null;
+        return data;
+      }).then((data) => {
+        profileCache = { data, timestamp: Date.now() };
+        return data;
+      }).catch((error) => {
+        profileRequestInFlight = null;
+        throw error;
+      });
+      
+      return profileRequestInFlight as Promise<T>;
+    }
+    
+    // For all other endpoints, make normal request
     const response = await fetch(resolveEndpoint(endpoint), {
       method: "GET",
       credentials: "include", // <-- This sends the auth cookie

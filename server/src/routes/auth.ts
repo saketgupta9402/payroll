@@ -8,6 +8,16 @@ const TOKEN_COOKIE = "session";
 
 export const authRouter = Router();
 
+// Feature flag to disable local auth in Payroll
+const DISABLE_LOCAL = process.env.DISABLE_PAYROLL_LOCAL_AUTH === 'true';
+
+if (DISABLE_LOCAL) {
+  // Block all local auth routes when disabled
+  authRouter.use((_req, res) => {
+    return res.status(403).json({ error: 'Local authentication is disabled' });
+  });
+}
+
 authRouter.post("/signup", async (req, res) => {
   const { email, password, fullName, companyName, subdomain } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "email and password required" });

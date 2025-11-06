@@ -4,7 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Building2, Users, IndianRupee, FileText, LogOut, PlusCircle, Calendar, CheckCircle2, Clock } from "lucide-react";
+import { Building2, Users, IndianRupee, FileText, LogOut, PlusCircle, Calendar, CheckCircle2, Clock, Key } from "lucide-react";
 import { toast } from "sonner";
 
 // Define a type for the profile state
@@ -12,6 +12,23 @@ interface UserProfile {
   email: string;
   full_name: string;
   tenant_id: string;
+  payroll_role?: string;
+  first_name?: string;
+  last_name?: string;
+  hr_user_id?: string;
+}
+
+interface EmployeeData {
+  id: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  full_name: string;
+  employee_code?: string;
+  department?: string;
+  designation?: string;
+  status?: string;
+  date_of_joining?: string;
 }
 
 const Dashboard = () => {
@@ -19,6 +36,8 @@ const Dashboard = () => {
   const [user, setUser] = useState<{ id: string } | null>(null);
   // Add state for the user's profile
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [employee, setEmployee] = useState<EmployeeData | null>(null);
+  const [payrollRole, setPayrollRole] = useState<string>('payroll_employee');
   const [loading, setLoading] = useState(true);
   const [companyName, setCompanyName] = useState<string>("Loading...");
   const [stats, setStats] = useState({
@@ -33,58 +52,147 @@ const Dashboard = () => {
   const [recentCycles, setRecentCycles] = useState<any[]>([]);
 
   useEffect(() => {
-    const checkAuth = async () => {
+    // Use API call to check authentication instead of reading cookies
+    // Cookies are httpOnly, so we can't read them with document.cookie
+    const checkAuthAndLoad = async () => {
       try {
-        const session = await api.auth.session();
-        if (!session?.session) {
-          navigate("/auth");
-          return;
+        // Try to get user info from API - if this succeeds, user is authenticated
+        const res: any = await api.me.profile();
+        if (res?.profile?.id) {
+          setUser({ id: res.profile.id });
+          setProfile(res.profile);
+          
+          // Check role - if employee, redirect to employee portal
+          const role = res.profile.payroll_role || 'payroll_employee';
+          setPayrollRole(role);
+          
+          if (role === 'payroll_employee') {
+            // Employee should see employee portal, not admin dashboard
+            console.log('[Dashboard] User is employee, redirecting to employee-portal');
+            navigate("/employee-portal", { replace: true });
+            return;
+          }
+          
+          // Admin/HR/CEO can see admin dashboard - continue loading data
+          console.log('[Dashboard] User on Dashboard, role:', role, 'showing dashboard content');
+          
+          // Load dashboard data (tenant, stats, cycles) - profile already fetched above
+          try {
+            const [tenantRes, statsRes, cyclesRes] = await Promise.all([
+              api.dashboard.tenant(),
+              api.dashboard.stats(),
+              api.dashboard.cycles(),
+            ]);
+
+            if (tenantRes?.tenant?.company_name) setCompanyName(tenantRes.tenant.company_name);
+            if (statsRes?.stats) setStats(statsRes.stats);
+            if (cyclesRes?.cycles) {
+              // Get recent 5 cycles
+              setRecentCycles(cyclesRes.cycles.slice(0, 5));
+            }
+          } catch (dataError: any) {
+            console.error('[Dashboard] Error loading dashboard data:', dataError);
+            // Don't redirect on data errors - just show what we have
+          } finally {
+            setLoading(false);
+          }
+        } else {
+          // No profile, redirect to pin-auth
+          console.log('[Dashboard] No profile found, redirecting to pin-auth');
+          navigate("/pin-auth");
         }
-        setUser({ id: session.session.userId });
-      } catch (error) {
-        navigate("/auth");
-      }
-    };
-
-    checkAuth();
-  }, [navigate]);
-
-  useEffect(() => {
-    const load = async () => {
-      if (!user) return;
-      
-      try {
-        // Fetch profile, tenant, stats, and recent cycles
-        const [profileRes, tenantRes, statsRes, cyclesRes] = await Promise.all([
-          api.me.profile(),
-          api.dashboard.tenant(),
-          api.dashboard.stats(),
-          api.dashboard.cycles(),
-        ]);
-
-        if (profileRes?.profile) setProfile(profileRes.profile);
-        if (tenantRes?.tenant?.company_name) setCompanyName(tenantRes.tenant.company_name);
-        if (statsRes?.stats) setStats(statsRes.stats);
-        if (cyclesRes?.cycles) {
-          // Get recent 5 cycles
-          setRecentCycles(cyclesRes.cycles.slice(0, 5));
-        }
-
       } catch (error: any) {
-        toast.error(`Failed to load dashboard: ${error.message}`);
-        if (error.message.includes("Unauthorized")) {
-          navigate("/auth");
+        // If API call fails, check if it's an auth error
+        console.error('[Dashboard] Profile fetch failed:', error.message);
+        
+        // If it's a 401/403, user needs to authenticate
+        if (error.message && (error.message.includes('Unauthorized') || error.message.includes('401') || error.message.includes('403'))) {
+          console.log('[Dashboard] Unauthorized, redirecting to pin-auth');
+          navigate("/pin-auth");
+        } else {
+          // Other error - still allow dashboard access (might be temporary)
+          console.log('[Dashboard] Non-auth error, allowing dashboard access');
+          setUser({ id: 'unknown' });
+          setLoading(false);
         }
-      } finally {
-        setLoading(false);
       }
     };
-    load();
-  }, [user, navigate]);
+
+    checkAuthAndLoad();
+  }, [navigate]);
+  
+  // Function to fetch employee data from HR system
+  const fetchEmployeeFromHr = async (hrUserId: string, orgId: string) => {
+    try {
+      // Use profile email to fetch employee from HR
+      if (!profile?.email) {
+        console.warn('No email in profile to fetch employee from HR');
+        return;
+      }
+      
+      const hrApiUrl = import.meta.env.VITE_HR_API_URL || 'http://localhost:3001';
+      // Try to fetch employee by email from HR
+      const response = await fetch(`${hrApiUrl}/api/employees?email=${encodeURIComponent(profile.email)}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        // HR returns an array of employees, find the one matching the email
+        const hrEmployee = Array.isArray(data.employees) 
+          ? data.employees.find((emp: any) => emp.email === profile.email)
+          : data.employee;
+        
+        if (hrEmployee) {
+          // Create employee record in Payroll if it doesn't exist
+          try {
+            await api.employees.create({
+              email: hrEmployee.email || profile.email,
+              first_name: hrEmployee.first_name || profile.first_name || '',
+              last_name: hrEmployee.last_name || profile.last_name || '',
+              employee_code: hrEmployee.employee_code,
+              department: hrEmployee.department,
+              designation: hrEmployee.designation || hrEmployee.job_title,
+              status: hrEmployee.status || 'active',
+              date_of_joining: hrEmployee.date_of_joining,
+            });
+            
+            // Fetch the created employee
+            const employeeRes: any = await api.me.employee();
+            if (employeeRes?.employee) {
+              setEmployee(employeeRes.employee);
+            }
+          } catch (createError: any) {
+            console.error('Error creating employee in Payroll:', createError);
+            // Still set the employee data from HR for display
+            setEmployee({
+              id: hrEmployee.id || hrUserId,
+              email: hrEmployee.email || profile.email,
+              first_name: hrEmployee.first_name || profile.first_name || '',
+              last_name: hrEmployee.last_name || profile.last_name || '',
+              full_name: hrEmployee.full_name || `${hrEmployee.first_name || profile.first_name || ''} ${hrEmployee.last_name || profile.last_name || ''}`,
+              employee_code: hrEmployee.employee_code,
+              department: hrEmployee.department,
+              designation: hrEmployee.designation || hrEmployee.job_title,
+              status: hrEmployee.status || 'active',
+              date_of_joining: hrEmployee.date_of_joining,
+            });
+          }
+        }
+      }
+    } catch (error: any) {
+      console.error('Error fetching employee from HR:', error);
+      // Silently fail - employee data will be shown as unavailable
+    }
+  };
 
   const handleSignOut = async () => {
     await api.auth.logout();
-    navigate("/auth");
+    navigate("/pin-auth");
     toast.success("Signed out successfully");
   };
 
@@ -111,20 +219,86 @@ const Dashboard = () => {
               <p className="text-xs text-muted-foreground">{profile?.email || user?.id}</p>
             </div>
           </div>
-          <Button variant="outline" size="sm" onClick={handleSignOut}>
-            <LogOut className="mr-2 h-4 w-4" />
-            Sign Out
-          </Button>
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" size="sm" onClick={() => navigate("/change-pin")}>
+                    <Key className="mr-2 h-4 w-4" />
+                    Change PIN
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleSignOut}>
+                    <LogOut className="mr-2 h-4 w-4" />
+                    Sign Out
+                  </Button>
+                </div>
         </div>
       </header>
 
       {/* Main Content */}
       <main className="container mx-auto px-4 py-8">
         <div className="mb-8">
-          <h2 className="text-3xl font-bold text-foreground mb-2">Dashboard</h2>
-          <p className="text-muted-foreground">Manage your payroll operations efficiently</p>
+          <h2 className="text-3xl font-bold text-foreground mb-2">
+            {payrollRole === 'payroll_admin' ? 'Admin Dashboard' : 'Employee Dashboard'}
+          </h2>
+          <p className="text-muted-foreground">
+            {payrollRole === 'payroll_admin' 
+              ? 'Manage your payroll operations efficiently' 
+              : employee 
+                ? `Welcome, ${employee.full_name || employee.first_name || profile?.full_name || profile?.email}` 
+                : 'Your payroll information'}
+          </p>
         </div>
 
+        {/* Employee Profile Section (for employees) */}
+        {payrollRole === 'payroll_employee' && employee && (
+          <Card className="mb-8 shadow-md">
+            <CardHeader>
+              <CardTitle className="flex items-center">
+                <Users className="mr-2 h-5 w-5 text-primary" />
+                My Profile
+              </CardTitle>
+              <CardDescription>Your employee information</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                <div>
+                  <p className="text-sm font-medium text-muted-foreground">Name</p>
+                  <p className="text-lg font-semibold">{employee.full_name || `${employee.first_name} ${employee.last_name}`}</p>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-muted-foreground">Email</p>
+                  <p className="text-lg font-semibold">{employee.email}</p>
+                </div>
+                {employee.employee_code && (
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">Employee Code</p>
+                    <p className="text-lg font-semibold">{employee.employee_code}</p>
+                  </div>
+                )}
+                {employee.department && (
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">Department</p>
+                    <p className="text-lg font-semibold">{employee.department}</p>
+                  </div>
+                )}
+                {employee.designation && (
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">Designation</p>
+                    <p className="text-lg font-semibold">{employee.designation}</p>
+                  </div>
+                )}
+                {employee.status && (
+                  <div>
+                    <p className="text-sm font-medium text-muted-foreground">Status</p>
+                    <p className="text-lg font-semibold capitalize">{employee.status}</p>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Admin Stats Grid (only for admin) */}
+        {payrollRole === 'payroll_admin' && (
+        <>
         {/* Stats Grid */}
         <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4 mb-8">
           <Card className="shadow-md hover:shadow-lg transition-shadow">
@@ -317,7 +491,7 @@ const Dashboard = () => {
           </Card>
         </div>
 
-        {/* Getting Started */}
+        {/* Getting Started (only for admin) */}
         <Card className="mt-8 bg-gradient-to-br from-primary/10 to-accent/10 border-primary/20">
           <CardHeader>
             <CardTitle>Getting Started</CardTitle>
@@ -344,6 +518,43 @@ const Dashboard = () => {
             </div>
           </CardContent>
         </Card>
+        </>
+        )}
+
+        {/* Employee Quick Links (only for employees) */}
+        {payrollRole === 'payroll_employee' && (
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 mt-8">
+            <Card className="shadow-md hover:shadow-lg transition-shadow cursor-pointer" onClick={() => navigate("/employee-portal")}>
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <FileText className="mr-2 h-5 w-5 text-primary" />
+                  My Payslips
+                </CardTitle>
+                <CardDescription>View and download your payslips</CardDescription>
+              </CardHeader>
+            </Card>
+
+            <Card className="shadow-md hover:shadow-lg transition-shadow cursor-pointer" onClick={() => navigate("/employee-portal")}>
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <IndianRupee className="mr-2 h-5 w-5 text-green-500" />
+                  Salary Structure
+                </CardTitle>
+                <CardDescription>View your salary breakdown</CardDescription>
+              </CardHeader>
+            </Card>
+
+            <Card className="shadow-md hover:shadow-lg transition-shadow cursor-pointer" onClick={() => navigate("/employee-portal")}>
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <FileText className="mr-2 h-5 w-5 text-blue-500" />
+                  Tax Documents
+                </CardTitle>
+                <CardDescription>Download Form 16 and tax forms</CardDescription>
+              </CardHeader>
+            </Card>
+          </div>
+        )}
       </main>
     </div>
   );

@@ -5,7 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 // Use the new API client
 import { api } from "../lib/api";
-import { DollarSign, LogOut, Receipt, FileText } from "lucide-react";
+import { DollarSign, LogOut, Receipt, FileText, Key } from "lucide-react";
 // Use sonner for toasts, consistent with other components
 import { toast } from "sonner";
 // Import the child components
@@ -23,26 +23,68 @@ const EmployeePortal = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchData = async () => {
+    const fetchData = async (retryCount = 0) => {
       try {
-        const session = await api.auth.session();
-        if (!session?.session) {
-          navigate("/auth");
-          return;
+        // Wait a moment for cookies to be available (they might be set by redirect)
+        // This is especially important when coming from PIN verification
+        if (retryCount === 0) {
+          // First attempt - wait a bit for cookies to be set
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
-        setUser({ id: session.session.userId });
+        
+        // Check for session and PIN cookies (cookie-based auth)
+        // Note: httpOnly cookies won't be accessible via document.cookie
+        // So we'll try to make an API call - if it succeeds, cookies are set
+        // If it fails with 401, cookies are missing
+        
+        console.log('[EmployeePortal] Attempting to load data (retry:', retryCount, ')');
+        
+        // Try to get user info from API - this will fail if cookies aren't set
+        let profile: any = null;
+        try {
+          profile = await api.me.profile();
+          console.log('[EmployeePortal] Successfully fetched profile, cookies are set');
+          if (profile?.profile?.id) {
+            setUser({ id: profile.profile.id });
+          } else {
+            setUser({ id: 'unknown' }); // Fallback
+          }
+        } catch (error: any) {
+          // If unauthorized, cookies might not be set yet
+          if (error.message && error.message.includes("Unauthorized")) {
+            if (retryCount < 3) {
+              console.log('[EmployeePortal] Unauthorized, waiting for cookies... (retry:', retryCount + 1, ')');
+              setTimeout(() => {
+                fetchData(retryCount + 1);
+              }, 1000); // Wait 1 second for cookies to be available
+              return;
+            } else {
+              // Still unauthorized after retries, redirect to pin-auth
+              console.log('[EmployeePortal] Still unauthorized after retries, redirecting to pin-auth');
+              navigate("/pin-auth");
+              return;
+            }
+          } else {
+            // Other error, set fallback
+            setUser({ id: 'unknown' }); // Fallback if API fails
+          }
+        }
 
         const me = await api.me.employee();
         if (me.employee) {
           setEmployee(me.employee);
         } else {
-          // This user is not an employee, redirect to admin dashboard
-          navigate("/dashboard");
+          // This user is not an employee, check role and redirect accordingly
+          const profile = await api.me.profile();
+          const payrollRole = profile?.profile?.payroll_role || 'payroll_employee';
+          const redirectPath = payrollRole === 'payroll_admin' ? '/employees' : '/employee-portal';
+          console.log('[EmployeePortal] User is not an employee, role:', payrollRole, 'redirecting to:', redirectPath);
+          navigate(redirectPath, { replace: true });
           return;
         }
       } catch (error: any) {
         toast.error(`Session error: ${error.message}`);
-        navigate("/auth");
+        navigate("/pin-auth");
       } finally {
         setLoading(false);
       }
@@ -55,7 +97,7 @@ const EmployeePortal = () => {
     try {
       await api.auth.logout();
       toast.success("Signed out successfully");
-      navigate("/auth");
+      navigate("/pin-auth");
     } catch (error: any) {
       toast.error(`Sign out failed: ${error.message}`);
     }
@@ -78,10 +120,16 @@ const EmployeePortal = () => {
               <h1 className="text-3xl font-bold text-foreground">Employee Portal</h1>
               <p className="text-muted-foreground">Welcome, {employee?.full_name || user?.id}</p>
             </div>
-            <Button variant="ghost" onClick={handleSignOut}>
-              <LogOut className="mr-2 h-4 w-4" />
-              Sign Out
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" onClick={() => navigate("/change-pin")}>
+                <Key className="mr-2 h-4 w-4" />
+                Change PIN
+              </Button>
+              <Button variant="ghost" onClick={handleSignOut}>
+                <LogOut className="mr-2 h-4 w-4" />
+                Sign Out
+              </Button>
+            </div>
           </div>
         </div>
       </header>

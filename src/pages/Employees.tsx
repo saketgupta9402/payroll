@@ -30,16 +30,52 @@ const Employees = () => {
   }, [location, navigate]);
 
   useEffect(() => {
-    const loadData = async () => {
+    const loadData = async (retryCount = 0) => {
       try {
-        const session = await api.auth.session();
-        if (!session?.session) {
-          navigate("/auth");
-          return;
+        // Wait a moment for cookies to be available (they might be set by redirect)
+        // This is especially important when coming from PIN verification
+        if (retryCount === 0) {
+          // First attempt - wait a bit for cookies to be set
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        
+        // Check for session and PIN cookies (cookie-based auth)
+        // Note: httpOnly cookies won't be accessible via document.cookie
+        // So we'll try to make an API call - if it succeeds, cookies are set
+        // If it fails with 401, cookies are missing
+        
+        console.log('[Employees] Attempting to load data (retry:', retryCount, ')');
+        
+        // Try to fetch tenant - this will fail if cookies aren't set
+        let t;
+        try {
+          t = await api.dashboard.tenant();
+          console.log('[Employees] Successfully fetched tenant, cookies are set');
+        } catch (error: any) {
+          // If unauthorized, cookies might not be set yet
+          if (error.message && error.message.includes("Unauthorized")) {
+            if (retryCount < 3) {
+              console.log('[Employees] Unauthorized, waiting for cookies... (retry:', retryCount + 1, ')');
+              setTimeout(() => {
+                loadData(retryCount + 1);
+              }, 1000); // Wait 1 second for cookies to be available
+              return;
+            } else {
+              // Still unauthorized after retries, redirect to pin-auth
+              console.log('[Employees] Still unauthorized after retries, redirecting to pin-auth');
+              navigate("/pin-auth");
+              return;
+            }
+          } else {
+            // Other error, just show message
+            throw error;
+          }
         }
 
+        // Successfully fetched data, cookies are set
+        console.log('[Employees] Cookies are set, data loaded successfully');
+        
         // Fetch the tenant name for the header
-        const t = await api.dashboard.tenant();
         if (t?.tenant?.company_name) {
           setCompanyName(t.tenant.company_name);
         } else {
@@ -47,9 +83,13 @@ const Employees = () => {
         }
       } catch (error: any) {
         console.error("Error fetching tenant:", error);
-        toast.error("Failed to load tenant information");
-        if (error.message.includes("Unauthorized")) {
-          navigate("/auth");
+        // Don't redirect on API errors - just show error
+        // Only redirect if it's a clear authentication error
+        if (error.message && error.message.includes("Unauthorized")) {
+          console.log('[Employees] Unauthorized error, redirecting to pin-auth');
+          navigate("/pin-auth");
+        } else {
+          toast.error("Failed to load tenant information");
         }
       } finally {
         setIsLoading(false);

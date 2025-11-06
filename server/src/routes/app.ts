@@ -22,15 +22,16 @@ console.log("[ROUTES] POST /api/employees-test registered (test route)");
 
 // --- UPDATED HELPER FUNCTION ---
 // This function is defined once and used by the auth middleware
+// Payroll uses 'users' table, not 'profiles' table
 async function getUserTenant(userId: string) {
-  const profile = await query<{ tenant_id: string; email: string }>(
-    "SELECT tenant_id, email FROM profiles WHERE id = $1",
+  const user = await query<{ org_id: string; email: string }>(
+    "SELECT org_id as tenant_id, email FROM users WHERE id = $1",
     [userId]
   );
-  if (!profile.rows[0]) {
-    throw new Error("Profile not found");
+  if (!user.rows[0]) {
+    throw new Error("User not found");
   }
-  return profile.rows[0];
+  return user.rows[0];
 }
 
 // Helper function to calculate LOP days and paid days for an employee in a payroll month
@@ -91,6 +92,7 @@ async function calculateLopAndPaidDays(
 
 // --- UPDATED MIDDLEWARE ---
 // This middleware is now async. It verifies the user AND gets their tenant info.
+// If user doesn't exist, it attempts to create them from JWT token data.
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   // Wrap async logic to properly handle errors
   (async () => {
@@ -101,19 +103,63 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
       }
 
       // 1. Verify the token to get userId
-      const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
-      (req as any).userId = payload.userId;
+      const payload = jwt.verify(token, JWT_SECRET) as any;
+      const userId = payload.userId;
+      (req as any).userId = userId;
 
-      // 2. Fetch tenant_id and email
-      const profile = await getUserTenant(payload.userId);
+      // 2. Try to fetch tenant_id and email
+      let profile;
+      try {
+        profile = await getUserTenant(userId);
+      } catch (e: any) {
+        // User doesn't exist - try to create from JWT token data
+        if (e.message === "User not found") {
+          console.log(`[AUTH] User not found in Payroll: ${userId}, attempting to create from session`);
+          
+          // Try to create user from JWT payload
+          const email = payload.email || null;
+          const orgId = payload.orgId || payload.tenantId || null;
+          const payrollRole = payload.payrollRole || 'payroll_employee';
+          const hrUserId = payload.hrUserId || payload.sub || null;
+          
+          if (!email || !orgId) {
+            console.error(`[AUTH] Cannot create user: missing email (${email}) or orgId (${orgId})`);
+            return res.status(403).json({ 
+              error: "User profile not found",
+              message: "User does not exist in Payroll system. Please access through HR system to be auto-provisioned."
+            });
+          }
+          
+          // Create user in Payroll
+          const createResult = await query(
+            `INSERT INTO users (id, email, org_id, payroll_role, hr_user_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO UPDATE SET
+               email = COALESCE(EXCLUDED.email, users.email),
+               org_id = COALESCE(EXCLUDED.org_id, users.org_id),
+               payroll_role = COALESCE(EXCLUDED.payroll_role, users.payroll_role)
+             RETURNING org_id as tenant_id, email`,
+            [userId, email, orgId, payrollRole, hrUserId]
+          );
+          
+          if (!createResult.rows[0]) {
+            throw new Error("Failed to create user");
+          }
+          
+          profile = createResult.rows[0];
+          console.log(`✅ Created user from session: ${userId} (${email})`);
+        } else {
+          throw e;
+        }
+      }
       
-      // Validate profile data
+      // Validate user data
       if (!profile.tenant_id) {
-        console.error("[AUTH] Profile found but tenant_id is null for userId:", payload.userId);
-        return res.status(403).json({ error: "User is not associated with a tenant" });
+        console.error("[AUTH] User found but org_id (tenant_id) is null for userId:", userId);
+        return res.status(403).json({ error: "User is not associated with an organization" });
       }
       if (!profile.email) {
-        console.error("[AUTH] Profile found but email is null for userId:", payload.userId);
+        console.error("[AUTH] User found but email is null for userId:", userId);
         return res.status(403).json({ error: "User email not found" });
       }
 
@@ -123,7 +169,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
       next();
     } catch (e: any) {
       let error = "Unauthorized";
-      if (e.message === "Profile not found") {
+      if (e.message === "User not found" || e.message === "Profile not found") {
         error = "User profile not found. Please sign in again.";
       } else if (e.name === "JsonWebTokenError") {
         error = "Invalid token";
@@ -144,21 +190,139 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 appRouter.get("/profile", requireAuth, async (req, res) => {
   const userId = (req as any).userId as string;
-  const result = await query(
-    "SELECT tenant_id, email, full_name FROM profiles WHERE id = $1",
+  const tenantId = (req as any).tenantId as string;
+  const userEmail = (req as any).userEmail as string;
+  
+  // Payroll uses 'users' table, not 'profiles' table
+  let result = await query(
+    `SELECT 
+      id,
+      org_id as tenant_id, 
+      email, 
+      COALESCE(first_name || ' ' || last_name, email) as full_name,
+      first_name,
+      last_name,
+      payroll_role,
+      hr_user_id
+    FROM users WHERE id = $1`,
     [userId]
   );
-  return res.json({ profile: result.rows[0] || null });
+  
+  // If user doesn't exist, try to create from session data
+  if (!result.rows[0]) {
+    console.log(`[PROFILE] User not found in Payroll: ${userId}, attempting to create from session`);
+    
+    // Try to get user info from JWT token (might have hr_user_id)
+    const token = (req as any).cookies?.["session"];
+    if (token) {
+      try {
+        const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+        const payload = jwt.verify(token, JWT_SECRET) as any;
+        
+        // Try to create user with minimal info from session
+        // This happens if user was created but not properly synced
+        const insertResult = await query(
+          `INSERT INTO users (id, email, org_id, payroll_role, hr_user_id)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (id) DO UPDATE SET
+             email = COALESCE(EXCLUDED.email, users.email),
+             org_id = COALESCE(EXCLUDED.org_id, users.org_id),
+             payroll_role = COALESCE(EXCLUDED.payroll_role, users.payroll_role)
+           RETURNING id, org_id as tenant_id, email,
+             COALESCE(first_name || ' ' || last_name, email) as full_name,
+             first_name, last_name, payroll_role, hr_user_id`,
+          [
+            userId,
+            userEmail || payload.email || null,
+            tenantId || payload.orgId || null,
+            payload.payrollRole || 'payroll_employee',
+            payload.hrUserId || null
+          ]
+        );
+        
+        result = insertResult;
+        console.log(`✅ Created user profile from session: ${userId}`);
+      } catch (createError: any) {
+        console.error(`[PROFILE] Failed to create user from session:`, createError);
+        // Continue to return 404 below
+      }
+    }
+    
+    // If still no user, return 404
+    if (!result.rows[0]) {
+      console.error(`[PROFILE] User not found and could not be created: ${userId}`);
+      return res.status(404).json({ 
+        error: 'User profile not found',
+        message: 'User does not exist in Payroll system. Please access through HR system to be auto-provisioned.'
+      });
+    }
+  }
+  
+  return res.json({ profile: result.rows[0] });
 });
 
 appRouter.get("/tenant", requireAuth, async (req, res) => {
   const tenantId = (req as any).tenantId as string;
   if (!tenantId) return res.json({ tenant: null });
-  const tenant = await query(
-    "SELECT id, company_name FROM tenants WHERE id = $1",
-    [tenantId]
-  );
-  return res.json({ tenant: tenant.rows[0] || null });
+  
+  // Payroll uses 'organizations' table, not 'tenants' table
+  try {
+    // Try to find organization by org_id first, then by id
+    const tenant = await query(
+      `SELECT id, COALESCE(company_name, org_name, 'Organization') as company_name, 
+              org_id, subdomain 
+       FROM organizations 
+       WHERE org_id = $1 OR id = $1`,
+      [tenantId]
+    );
+    
+    // If organization found, return it
+    if (tenant.rows.length > 0) {
+      return res.json({ tenant: tenant.rows[0] });
+    }
+    
+    // If no organization found, create a minimal one
+    try {
+      const insertResult = await query(
+        `INSERT INTO organizations (org_id, company_name, id)
+         VALUES ($1, 'Organization', gen_random_uuid())
+         ON CONFLICT (org_id) DO UPDATE SET company_name = COALESCE(organizations.company_name, 'Organization')
+         RETURNING id, COALESCE(company_name, org_name, 'Organization') as company_name, org_id, subdomain`,
+        [tenantId]
+      );
+      if (insertResult.rows.length > 0) {
+        return res.json({ tenant: insertResult.rows[0] });
+      }
+      
+      // Fallback: query again
+      const created = await query(
+        `SELECT id, COALESCE(company_name, org_name, 'Organization') as company_name, org_id, subdomain 
+         FROM organizations WHERE org_id = $1`,
+        [tenantId]
+      );
+      return res.json({ tenant: created.rows[0] || { id: tenantId, company_name: 'Organization', org_id: tenantId } });
+    } catch (createError: any) {
+      // If creation fails, return a default tenant
+      console.error('Error creating organization:', createError.message);
+      return res.json({ 
+        tenant: { 
+          id: tenantId, 
+          company_name: 'Organization',
+          org_id: tenantId 
+        } 
+      });
+    }
+  } catch (error: any) {
+    // If query fails (table doesn't exist), return default tenant
+    console.error('Error fetching tenant:', error.message);
+    return res.json({ 
+      tenant: { 
+        id: tenantId, 
+        company_name: 'Organization',
+        org_id: tenantId 
+      } 
+    });
+  }
 });
 
 appRouter.get("/stats", requireAuth, async (req, res) => {
@@ -1258,6 +1422,19 @@ appRouter.post("/employees/:employeeId/compensation", requireAuth, async (req, r
     const userId = (req as any).userId as string;
     const tenantId = (req as any).tenantId as string;
     const { employeeId } = req.params;
+    
+    // Check if user has payroll_admin role (HR/CEO/Admin can add salary)
+    const userResult = await query(
+      `SELECT payroll_role FROM users WHERE id = $1 AND org_id = $2`,
+      [userId, tenantId]
+    );
+    
+    if (!userResult.rows[0] || userResult.rows[0].payroll_role !== 'payroll_admin') {
+      return res.status(403).json({ 
+        error: 'Insufficient permissions',
+        message: 'Only HR/Admin/CEO can add salary information'
+      });
+    }
     
     const {
       effective_from,
